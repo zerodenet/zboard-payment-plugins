@@ -1,0 +1,443 @@
+package handler
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/zerodenet/zboard/backend/internal/application"
+	"github.com/zerodenet/zboard/backend/internal/model"
+	"github.com/zerodenet/zboard/backend/internal/plugins"
+	"github.com/zeromicro/go-zero/rest/pathvar"
+)
+
+// Compiled only in an isolated ZBoard test checkout by check-host-integration.py.
+// The real plugin source is built with one test TLS root for the local provider;
+// no production TLS bypass, test credential, or host implementation is changed.
+func actualPaymentsPackage(t *testing.T, pub ed25519.PublicKey, key ed25519.PrivateKey, ca []byte) []byte {
+	t.Helper()
+	root := os.Getenv("ZBOARD_PAYMENT_PLUGIN_SOURCE")
+	directory := t.TempDir()
+	sourcePath := filepath.Join(root, "tdcloud", "client.go")
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testSource := strings.Replace(string(source), `"context"`, "\"context\"\n\"crypto/tls\"\n\"crypto/x509\"", 1)
+	testSource = strings.Replace(testSource, "if httpClient == nil {", "if httpClient == nil {\npool := x509.NewCertPool(); if !pool.AppendCertsFromPEM([]byte("+strconv.Quote(string(ca))+")) { panic(\"invalid test CA\") }", 1)
+	testSource = strings.Replace(testSource, "&http.Client{Timeout: 12 * time.Second", "&http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs:pool}}, Timeout: 12 * time.Second", 1)
+	modified := filepath.Join(directory, "client.go")
+	if err := os.WriteFile(modified, []byte(testSource), 0600); err != nil {
+		t.Fatal(err)
+	}
+	overlay, _ := json.Marshal(map[string]any{"Replace": map[string]string{sourcePath: modified}})
+	overlayPath := filepath.Join(directory, "overlay.json")
+	_ = os.WriteFile(overlayPath, overlay, 0600)
+	binary := filepath.Join(directory, "payments")
+	build := exec.Command("go", "build", "-overlay", overlayPath, "-o", binary, "./cmd/payments")
+	build.Dir = root
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("actual plugin build: %v %s", err, out)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest plugins.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	target := runtime.GOOS + "-" + runtime.GOARCH
+	executable := manifest.Components.Server.Executables[target]
+	manifest.Components.Server.Executables = map[string]string{target: executable}
+	payload, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{executable: payload}
+	for _, name := range []string{"payment.html", "payment-entry.mjs", "plugin-bridge.mjs", "payment-widget.mjs", "payment-flow.mjs", "config.html", "config-entry.mjs", "channel-config-providers.mjs", "tdcloud-config.mjs"} {
+		data, err := os.ReadFile(filepath.Join(root, "ui", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files["ui/"+name] = data
+	}
+	manifest.Files = map[string]string{}
+	for name, data := range files {
+		sum := sha256.Sum256(data)
+		manifest.Files[name] = hex.EncodeToString(sum[:])
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = json.Marshal(manifest)
+	files["manifest.json"] = raw
+	files["signature.json"], _ = json.Marshal(plugins.Signature{PublicKey: base64.StdEncoding.EncodeToString(pub), Algorithm: "ed25519", KeyID: "payments.integration", Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(key, raw))})
+	var buffer bytes.Buffer
+	archive := zip.NewWriter(&buffer)
+	for name, data := range files {
+		entry, err := archive.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
+type precisionCase struct {
+	currency                 string
+	decimals                 int
+	hostMinor, providerMinor int64
+}
+
+func TestActualPaymentsPluginClosesHostOrder(t *testing.T) {
+	for _, scenario := range []precisionCase{{"USD", 2, 1050, 1050}, {"TDC", 8, 1050, 1050000000}, {"JPY", 0, 1000, 10}} {
+		t.Run(scenario.currency, func(t *testing.T) { actualPaymentsPluginClosesHostOrder(t, scenario) })
+	}
+}
+func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
+	f := newOrderFixture(t)
+	attachOrderPublishEndpoint(t, f)
+	if err := f.h.db.Create(&model.Installation{ID: 1, SiteURL: "https://panel.example.test"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.db.Model(&f.skuRecord).Updates(map[string]any{"currency": scenario.currency, "price_cents": scenario.hostMinor}).Error; err != nil {
+		t.Fatal(err)
+	}
+	order := f.create(t, 0)
+	if order.PayableAmount != scenario.hostMinor || order.Currency != scenario.currency {
+		t.Fatalf("fixture amount: %+v", order)
+	}
+	var paid atomic.Bool
+	var creates atomic.Int32
+	var directoryDecimals atomic.Int32
+	directoryDecimals.Store(int32(scenario.decimals))
+	var lookupDecimals atomic.Int32
+	lookupDecimals.Store(int32(scenario.decimals))
+	var lookupAmount atomic.Int64
+	lookupAmount.Store(scenario.providerMinor)
+	var lookupCurrency atomic.Value
+	lookupCurrency.Store(scenario.currency)
+	occurred := time.Now().UTC().Truncate(time.Second)
+	const notifySecret = "actual-payment-plugin-notification-test-secret-42"
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "merchant-test", "expires_in": 3600})
+		case "/openapi/v1/merchant-payment-channels":
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{"payment_no": "test-channel", "currency": order.Currency, "currency_decimals": directoryDecimals.Load()}}})
+		case "/openapi/v1/merchant-payments":
+			var in struct {
+				PaymentNo *string `json:"payment_no"`
+				Amount    int64   `json:"amount_minor"`
+				Reference string  `json:"external_reference"`
+				Return    string  `json:"return_url"`
+				Notify    string  `json:"notify_url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			if in.PaymentNo != nil || in.Amount != scenario.providerMinor || in.Reference != order.TradeNo || !strings.Contains(in.Return, "payment_plugin=zboard.payments") || !strings.Contains(in.Return, fmt.Sprintf("payment_order=%d", order.ID)) || in.Notify == "" {
+				t.Errorf("trusted checkout mismatch: %+v", in)
+			}
+			creates.Add(1)
+			w.WriteHeader(201)
+			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "merchant-order-1", "external_reference": in.Reference, "return_url": in.Return, "payment_no": "", "amount_minor": in.Amount, "currency": order.Currency, "currency_decimals": scenario.decimals, "status": "pending", "checkout_url": "https://cashier.example.test/1", "expires_at": time.Now().Add(time.Hour)})
+		case "/openapi/v1/merchant-payments/merchant-order-1":
+			status := "pending"
+			if paid.Load() {
+				status = "paid"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "merchant-order-1", "external_reference": order.TradeNo, "payment_no": func() string {
+				if paid.Load() {
+					return "chosen-by-tdcloud"
+				}
+				return ""
+			}(), "amount_minor": lookupAmount.Load(), "currency": lookupCurrency.Load(), "currency_decimals": lookupDecimals.Load(), "status": status, "event_id": "provider-paid-1", "provider_trade_no": "provider-trade-1", "occurred_at": occurred})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer provider.Close()
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	options := plugins.Options{Directory: t.TempDir(), TrustedPublishers: map[string]string{"payments.integration": base64.StdEncoding.EncodeToString(pub)}}
+	newManager := func() *plugins.Manager {
+		m, err := plugins.NewManager(f.h.db, f.h.credentialCipher, options, "v0.0.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		host := application.NewPluginHostServices(f.h.services, f.h)
+		f.h.ConfigureNativePluginHost(host)
+		m.SetHostServices(host)
+		f.h.SetPluginManager(m)
+		t.Cleanup(m.Close)
+		return m
+	}
+	manager := newManager()
+	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: provider.Certificate().Raw})
+	installation, err := manager.Import(actualPaymentsPackage(t, pub, key, ca), "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := json.Marshal(map[string]any{"channels": []any{map[string]any{"id": "tdcloud-main", "name": "TDCloud test", "type": "tdcloud", "enabled": true, "settings": map[string]any{"currencies": map[string]int{scenario.currency: scenario.decimals}, "api_url": provider.URL, "client_id": "merchant", "client_secret": "merchant-test-secret", "notify_url": "https://panel.example.test/.well-known/zboard-payments/v1/tdcloud-notify", "notify_secret": notifySecret}}}})
+	revision, err := manager.ConfigRevision(installation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.db.Model(&model.User{}).Where("id = ?", 1).Update("is_admin", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	adminToken, _, err := f.h.issueToken(authClaims{UserID: 1, Email: "admin@example.test", IsAdmin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configSession, err := manager.CreateSession(installation.ID, "settings", "admin", 1, true, true)
+	if err != nil {
+		t.Fatalf("disabled plugin must support configuration: %v", err)
+	}
+	bridge := func(body []byte) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/api/v1/plugin-ui/bridge", bytes.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+adminToken)
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Plugin-Session", configSession.Token)
+		out := httptest.NewRecorder()
+		f.h.PluginBridgeHandler(out, r)
+		return out
+	}
+	for _, name := range []string{"config.html", "config-entry.mjs", "channel-config-providers.mjs", "tdcloud-config.mjs", "plugin-bridge.mjs"} {
+		r := httptest.NewRequest("GET", "https://panel.example.test/api/v1/plugin-assets/"+configSession.Token+"/ui/"+name, nil)
+		out := httptest.NewRecorder()
+		f.h.PluginAssetHandler(out, r)
+		if out.Code != 200 {
+			t.Fatalf("admin configuration asset %s: %d", name, out.Code)
+		}
+	}
+	initial := bridge([]byte(`{"type":"config.load"}`))
+	if initial.Code != 200 {
+		t.Fatalf("initial configuration: %d %s", initial.Code, initial.Body.String())
+	}
+	saveBody, _ := json.Marshal(map[string]any{"type": "config.save", "revision": revision.Revision, "config": json.RawMessage(cfg)})
+	if out := bridge(saveBody); out.Code != 200 {
+		t.Fatalf("configuration save bridge: %d %s", out.Code, out.Body.String())
+	}
+	view := bridge([]byte(`{"type":"config.load"}`))
+	if view.Code != 200 || strings.Contains(view.Body.String(), "merchant-test-secret") || strings.Contains(view.Body.String(), notifySecret) {
+		t.Fatalf("admin config view: %d %s", view.Code, view.Body.String())
+	}
+	if out := bridge([]byte(`{"type":"config.test"}`)); out.Code != 200 {
+		t.Fatalf("configuration test bridge: %d %s", out.Code, out.Body.String())
+	}
+	action := func(extra bool) *httptest.ResponseRecorder {
+		body := map[string]any{"generation": installation.Generation, "accept_untested": false}
+		if extra {
+			body["version_id"] = ""
+		}
+		raw, _ := json.Marshal(body)
+		r := httptest.NewRequest("POST", "/api/v1/admin/plugins/"+installation.ID+"/actions/enable", bytes.NewReader(raw))
+		r.Header.Set("Authorization", "Bearer "+adminToken)
+		r.Header.Set("Content-Type", "application/json")
+		out := httptest.NewRecorder()
+		f.h.AdminPluginActionHandler(out, pathvar.WithVars(r, map[string]string{"id": installation.ID, "action": "enable"}))
+		return out
+	}
+	// The fixed frontend omits retired fields. Keep the negative HTTP boundary
+	// check: unknown fields must still be rejected before plugin execution.
+	if out := action(true); out.Code != 400 || !strings.Contains(out.Body.String(), "invalid or oversized plugin request") {
+		t.Fatalf("unknown lifecycle field was not rejected: %d %s", out.Code, out.Body.String())
+	}
+	if out := action(false); out.Code != 200 {
+		t.Fatalf("valid host enable request: %d %s", out.Code, out.Body.String())
+	}
+	t.Log("Admin configuration bridge and valid HTTP enable succeeded; strict request validation preserved")
+	slots, err := manager.Slots("account", plugins.CheckoutPaymentSlot, 1, true)
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("actual slot: %+v %v", slots, err)
+	}
+	pages, err := manager.Pages("account", 1, true)
+	if err != nil || len(pages) != 0 {
+		t.Fatal("unexpected checkout menu")
+	}
+	session, err := manager.CreateSlotSession(installation.ID, "payment-methods", plugins.CheckoutPaymentSlot, "account", 1, true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"payment.html", "payment-entry.mjs", "plugin-bridge.mjs"} {
+		asset := httptest.NewRequest("GET", "https://panel.example.test/api/v1/plugin-assets/"+session.Token+"/ui/"+name, nil)
+		response := httptest.NewRecorder()
+		f.h.PluginAssetHandler(response, asset)
+		if response.Code != 200 || response.Header().Get("Access-Control-Allow-Origin") != "*" || (strings.HasSuffix(name, ".mjs") && !strings.Contains(response.Header().Get("Content-Type"), "javascript")) {
+			t.Fatalf("iframe asset %s: %d %v", name, response.Code, response.Header())
+		}
+	}
+	methods, err := manager.SessionPageAction(t.Context(), session.Token, 1, true, "payments.methods", json.RawMessage(fmt.Sprintf(`{"currency":%q}`, order.Currency)))
+	if err != nil || !strings.Contains(string(methods), "tdcloud-main") {
+		t.Fatalf("method discovery: %s %v", methods, err)
+	}
+	payload := json.RawMessage(`{"option_id":"tdcloud-main"}`)
+	prepared, err := manager.SessionCheckoutAction(t.Context(), session.Token, 1, true, order.ID, "payments.prepare", payload)
+	if err != nil || !strings.Contains(string(prepared), `"checkout_url":"https://cashier.example.test/1"`) {
+		t.Fatalf("prepare: %s %v", prepared, err)
+	}
+	if _, err := manager.SessionCheckoutAction(t.Context(), session.Token, 1, true, order.ID, "payments.prepare", json.RawMessage(`{"option_id":"tdcloud-main","amount_minor":1}`)); err == nil {
+		t.Fatal("browser amount accepted")
+	}
+	pending, err := manager.SessionCheckoutAction(t.Context(), session.Token, 1, true, order.ID, "payments.reconcile", payload)
+	if err != nil || !strings.Contains(string(pending), `"state":"pending"`) {
+		t.Fatalf("pending: %s %v", pending, err)
+	}
+	manager.Close()
+	directoryDecimals.Store(int32((scenario.decimals + 1) % 9))
+	manager = newManager()
+	orderSession, err := manager.CreateSlotSession(installation.ID, "order-payment", plugins.OrderPaymentSlot, "account", 1, true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SessionCheckoutAction(t.Context(), orderSession.Token, 1, true, order.ID, "payments.prepare", payload); err != nil || creates.Load() != 1 {
+		t.Fatalf("restart duplicate checkout: %v creates=%d", err, creates.Load())
+	}
+	paid.Store(true)
+	// Authenticated lookup results must preserve the saved amount, currency and precision.
+	for _, bad := range []string{"amount", "currency", "precision"} {
+		switch bad {
+		case "amount":
+			lookupAmount.Store(scenario.providerMinor + 1)
+		case "currency":
+			lookupCurrency.Store("ZZZ")
+		case "precision":
+			lookupDecimals.Store(int32((scenario.decimals + 1) % 9))
+		}
+		if _, err := manager.SessionCheckoutAction(t.Context(), orderSession.Token, 1, true, order.ID, "payments.reconcile", payload); err == nil {
+			t.Fatalf("accepted conflicting lookup %s", bad)
+		}
+		lookupAmount.Store(scenario.providerMinor)
+		lookupCurrency.Store(scenario.currency)
+		lookupDecimals.Store(int32(scenario.decimals))
+	}
+	var unpaidEvents int64
+	f.h.db.Model(&model.PaymentEvent{}).Count(&unpaidEvents)
+	if unpaidEvents != 0 {
+		t.Fatal("conflicting lookup recorded payment")
+	}
+	event, _ := json.Marshal(map[string]any{"id": "notification-1", "type": "merchant_payment.status_changed", "api_version": 1, "created_at": occurred, "data": map[string]any{"order_no": "merchant-order-1", "external_reference": order.TradeNo, "payment_no": "selected-inside-cashier", "amount_minor": scenario.providerMinor, "currency": order.Currency, "currency_decimals": scenario.decimals, "status": "paid", "status_version": 2, "event_id": "provider-paid-1"}})
+	deliver := func(body []byte) *httptest.ResponseRecorder {
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+		mac := hmac.New(sha256.New, []byte(notifySecret))
+		_, _ = mac.Write([]byte(timestamp + "."))
+		_, _ = mac.Write(body)
+		r := httptest.NewRequest("POST", "/.well-known/zboard-payments/v1/tdcloud-notify", bytes.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-TDCloud-Event-ID", "notification-1")
+		r.Header.Set("X-TDCloud-Timestamp", timestamp)
+		r.Header.Set("X-TDCloud-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+		out := httptest.NewRecorder()
+		f.h.PluginPublicRouteHandler(out, r)
+		return out
+	}
+	// Even correctly signed notifications must match the saved attempt.
+	for _, field := range []string{"amount_minor", "currency", "currency_decimals", "external_reference", "missing precision"} {
+		var bad map[string]any
+		_ = json.Unmarshal(event, &bad)
+		data := bad["data"].(map[string]any)
+		switch field {
+		case "amount_minor":
+			data[field] = scenario.providerMinor + 1
+		case "currency":
+			data[field] = "ZZZ"
+		case "currency_decimals":
+			data[field] = (scenario.decimals + 1) % 9
+		case "external_reference":
+			data[field] = "other-order"
+		case "missing precision":
+			delete(data, "currency_decimals")
+		}
+		body, _ := json.Marshal(bad)
+		out := deliver(body)
+		if out.Code != 400 {
+			t.Fatalf("accepted conflicting signed notification %s: %d %s", field, out.Code, out.Body.String())
+		}
+	}
+	f.h.db.Model(&model.PaymentEvent{}).Count(&unpaidEvents)
+	if unpaidEvents != 0 {
+		t.Fatal("conflicting notification recorded payment")
+	}
+	notify := func() error {
+		out := deliver(event)
+		if out.Code != 200 {
+			return fmt.Errorf("notification HTTP %d: %s", out.Code, out.Body.String())
+		}
+		return nil
+	}
+	failures := make(chan error, 3)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := manager.SessionCheckoutAction(context.Background(), orderSession.Token, 1, true, order.ID, "payments.reconcile", payload)
+			failures <- err
+		}()
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); failures <- notify() }()
+	wg.Wait()
+	close(failures)
+	for err := range failures {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	var stored model.Order
+	if err := f.h.db.First(&stored, order.ID).Error; err != nil || stored.Status != "paid" || stored.SubscriptionID == 0 || stored.FulfilledAt == nil {
+		t.Fatalf("actual host settlement: %+v %v", stored, err)
+	}
+	for table, want := range map[string]int64{"payment_events": 1, "subscriptions": 1, "protocol_credentials": 1} {
+		var count int64
+		if err := f.h.db.Table(table).Count(&count).Error; err != nil || count != want {
+			t.Fatalf("%s=%d: %v", table, count, err)
+		}
+	}
+	manager.RevokeSession(orderSession.Token, 1)
+	if err := notify(); err != nil {
+		t.Fatal(err)
+	}
+	manager.Close()
+	manager = newManager()
+	if err := notify(); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	f.h.db.Model(&model.PaymentEvent{}).Count(&count)
+	if count != 1 {
+		t.Fatal("restart replay created another event")
+	}
+	var paymentEvent model.PaymentEvent
+	if err := f.h.db.First(&paymentEvent).Error; err != nil || paymentEvent.AmountMinor != scenario.hostMinor {
+		t.Fatalf("host ledger used provider units: %+v %v", paymentEvent, err)
+	}
+	t.Logf("Actual payment plugin %s/%d: host_amount=%d provider_amount=%d order=%d paid, subscription=%d, events=%d, creates=%d", scenario.currency, scenario.decimals, scenario.hostMinor, scenario.providerMinor, stored.ID, stored.SubscriptionID, count, creates.Load())
+}

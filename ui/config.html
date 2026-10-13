@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>支付渠道配置</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.6 system-ui, sans-serif; }
+    body { margin: 0; background: transparent; color: CanvasText; }
+    [hidden] { display: none !important; }
+    main { padding: 12px; max-width: 760px; margin: auto; }
+    h2 { font-size: 18px; margin: 8px 0; }
+    p, small { color: GrayText; }
+    .actions, .channels { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+    fieldset { border: 1px solid GrayText; border-radius: 10px; padding: 16px; }
+    label { display: block; margin-top: 12px; }
+    input:not([type=checkbox]), select, textarea { display: block; box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid GrayText; border-radius: 6px; background: Canvas; color: CanvasText; font: inherit; }
+    button { border: 1px solid GrayText; border-radius: 6px; padding: 8px 14px; background: Canvas; color: CanvasText; font: inherit; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: default; }
+    button.primary { background: #6d28d9; color: white; border-color: #6d28d9; }
+    #notice { min-height: 24px; }
+    [data-error=true] { color: #b91c1c; }
+  </style>
+</head>
+<body><main id="config"><p role="status">正在加载支付渠道配置</p></main>
+<script type="module">
+  import { mountConfigEntry } from "./config-entry.mjs";
+  void mountConfigEntry(document.getElementById("config"));
+</script></body>
+</html>

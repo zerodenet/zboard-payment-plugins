@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>支付方式</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; }
+    body { margin: 0; background: transparent; color: CanvasText; }
+    button { font: inherit; color: inherit; background: Canvas; border: 1px solid GrayText; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+    #payment { min-height: 40px; padding: 4px; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <main id="payment"><p role="status">正在加载支付方式</p></main>
+  <script type="module">
+    import { mountPaymentEntry } from "./payment-entry.mjs";
+    // The parent owns order creation, windows and payment confirmation.
+    void mountPaymentEntry(document.getElementById("payment"));
+  </script>
+</body>
+</html>

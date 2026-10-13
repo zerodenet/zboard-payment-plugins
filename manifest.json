@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "id": "zboard.payments",
+  "name": "支付通道",
+  "description": "通过可配置支付渠道创建收款订单，并在核实结果后由 ZBoard 完成订单和订阅结算。",
+  "version": "0.0.1",
+  "requires": {
+    "zboard": ">=0.0.1 <0.2.0",
+    "plugin_protocol": 1,
+    "ui_bridge": 1
+  },
+  "capabilities": [
+    "zboard.ui.page.v1",
+    "zboard.ui.slot.v1",
+    "zboard.config.v1",
+    "zboard.storage.v1",
+    "zboard.http.route.v1",
+    "zboard.commerce.orders.read.v1",
+    "zboard.commerce.payments.write.v1"
+  ],
+  "data": {
+    "version": 1,
+    "min_compatible_version": 1,
+    "migrations": [
+      {
+        "version": 1,
+        "changes": []
+      }
+    ]
+  },
+  "surfaces": [
+    "account",
+    "admin"
+  ],
+  "components": {
+    "ui": {
+      "account": "ui/payment.html",
+      "admin": "ui/config.html"
+    },
+    "server": {
+      "executables": {
+        "linux-amd64": "runtimes/linux-amd64/payments",
+        "linux-arm64": "runtimes/linux-arm64/payments",
+        "darwin-amd64": "runtimes/darwin-amd64/payments",
+        "darwin-arm64": "runtimes/darwin-arm64/payments"
+      }
+    }
+  },
+  "contributions": {
+    "pages": [
+      {
+        "id": "settings",
+        "surface": "admin",
+        "title": "支付渠道配置",
+        "purpose": "configuration"
+      }
+    ],
+    "http_routes": [
+      {
+        "id": "tdcloud-notification",
+        "method": "POST",
+        "path": "/.well-known/zboard-payments/v1/tdcloud-notify"
+      }
+    ],
+    "slots": [
+      {
+        "id": "payment-methods",
+        "surface": "account",
+        "slot": "account.checkout.payment",
+        "title": "支付通道",
+        "entrypoint": "ui/payment.html"
+      },
+      {
+        "id": "order-payment",
+        "surface": "account",
+        "slot": "account.orders.payment",
+        "title": "支付通道",
+        "entrypoint": "ui/payment.html"
+      }
+    ]
+  },
+  "files": {}
+}
