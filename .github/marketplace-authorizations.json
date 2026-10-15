@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "authorizations": [
+    {
+      "marketplace": "zerodenet/plugins",
+      "issue": 7,
+      "actor_id": 294731350,
+      "body_sha256": "7948c8beea0511f2a550fb25d56631d4fce931d4c8c79c8b1528fce16ffdc0a8"
+    }
+  ]
+}
