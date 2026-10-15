@@ -17,6 +17,9 @@ VERSION = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
 
 def check_version(root=ROOT, tag=None):
     manifest = json.loads((root / 'manifest.json').read_text())
+    # The official packager serializes these optional host fields explicitly.
+    manifest['requires'].setdefault('recommended_zboard_version', '')
+    manifest['requires'].setdefault('tested_zboard_versions', None)
     version = manifest['version']
     if not VERSION.fullmatch(version):
         raise ValueError('manifest.version must be an unprefixed stable semantic version')

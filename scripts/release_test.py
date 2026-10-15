@@ -55,6 +55,14 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.write_key(self.root / 'wrong-key', env)
 
+    def test_official_packager_empty_host_fields_match_omitted_source_fields(self):
+        source = copy.deepcopy(self.manifest)
+        source['requires'].pop('recommended_zboard_version')
+        source['requires'].pop('tested_zboard_versions')
+        (self.root / 'manifest.json').write_text(json.dumps(source))
+        self.packages()
+        release.metadata(self.root, 'v0.0.1', 'a' * 40, self.pub)
+
     def test_metadata_has_four_exact_release_assets(self):
         self.packages()
         entry = release.metadata(self.root, 'v0.0.1', 'a' * 40, self.pub)
