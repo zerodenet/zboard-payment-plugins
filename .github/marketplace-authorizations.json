@@ -6,6 +6,12 @@
       "issue": 7,
       "actor_id": 294731350,
       "body_sha256": "7948c8beea0511f2a550fb25d56631d4fce931d4c8c79c8b1528fce16ffdc0a8"
+    },
+    {
+      "marketplace": "zerodenet/plugins",
+      "issue": 8,
+      "actor_id": 294731350,
+      "body_sha256": "071713d451d71ee69fd4a84662ab01f78b0be7515e217d00415cc2a04f038e1b"
     }
   ]
 }

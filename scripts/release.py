@@ -89,7 +89,7 @@ def metadata(root, tag, commit, pub):
                'surfaces': manifest['surfaces'], 'capabilities': manifest['capabilities'], 'artifacts': artifacts}
     return {'id': manifest['id'], 'name': 'Payment Channels for ZBoard',
             'description': 'Provider-neutral payment channels with a TDCloud hosted cashier adapter.',
-            'repository': REPOSITORY, 'maintainers': ['kovawx'], 'publisher': pub,
+            'repository': REPOSITORY, 'maintainers': ['zerodenet'], 'publisher': pub,
             'source': {'version': tag, 'commit': commit, 'manifest': 'manifest.json'}, 'releases': [release]}
 
 

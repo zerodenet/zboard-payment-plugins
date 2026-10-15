@@ -5,6 +5,7 @@ on:
     paths:
       - marketplace-listing.json
       - scripts/marketplace.py
+      - scripts/correct_attribution.py
       - .github/workflows/marketplace.yml
   workflow_dispatch:
     inputs:
@@ -51,6 +52,36 @@ jobs:
       - name: Validate registration and release contracts
         run: |
           PYTHONPATH=.local/marketplace/scripts python3 -c 'import json; from marketplace_schema import validate_release_manifest; validate_release_manifest(json.load(open("dist/marketplace-entry.json")))'
+      - name: Archive and apply approved v0.0.1 attribution correction
+        if: (inputs.tag || 'v0.0.1') == 'v0.0.1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release download v0.0.1 --pattern marketplace-entry.json --pattern release-metadata.json --dir "$RUNNER_TEMP/published-metadata"
+          python3 scripts/correct_attribution.py --published "$RUNNER_TEMP/published-metadata" --generated dist/marketplace-entry.json --output "$RUNNER_TEMP/attribution-correction"
+          # Preserve the exact original bytes before replacing any unsigned JSON.
+          shopt -s nullglob
+          for original in "$RUNNER_TEMP/attribution-correction/archive/"*.json; do
+            name=$(basename "$original")
+            if gh release download v0.0.1 --pattern "$name" --dir "$RUNNER_TEMP/archive-check"; then
+              cmp "$original" "$RUNNER_TEMP/archive-check/$name"
+            else
+              gh release upload v0.0.1 "$original"
+            fi
+          done
+          for name in release-metadata.json marketplace-entry.json; do
+            candidate="$RUNNER_TEMP/attribution-correction/$name"
+            if [ -f "$candidate" ]; then
+              gh release download v0.0.1 --pattern "$name" --dir "$RUNNER_TEMP/metadata-recheck"
+              cmp "$RUNNER_TEMP/published-metadata/$name" "$RUNNER_TEMP/metadata-recheck/$name"
+              gh release upload v0.0.1 "$candidate" --clobber
+              gh release download v0.0.1 --pattern "$name" --dir "$RUNNER_TEMP/metadata-verified"
+              cmp "$candidate" "$RUNNER_TEMP/metadata-verified/$name"
+            fi
+          done
+          cat "$RUNNER_TEMP/attribution-correction/plan.json" >> "$GITHUB_STEP_SUMMARY"
       - name: Add missing metadata without overwriting release assets
         env:
           GH_TOKEN: ${{ github.token }}

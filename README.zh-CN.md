@@ -2,6 +2,8 @@
 
 [English](README.md)
 
+作者及维护者：[zerodenet](https://github.com/zerodenet)。签名发布者：`zerodenet`。
+
 ZBoard 持有商品、业务订单、订阅和权益；插件持有渠道配置、支付尝试、渠道建单、服务端核对及通知验签。插件通过公开原生 SDK 提交已核实的支付事实，ZBoard 使用已有事务完成履约。浏览器返回本身不证明已支付。
 
 ## 已接入的宿主契约
@@ -149,7 +151,9 @@ TDCloud 收款单过期后仍可能从 `expired` 变为 `paid`。过期表示支
 - 变量 `PLUGIN_PUBLISHER_ID`：保留现有发布者身份。
 - 变量 `PLUGIN_PUBLIC_KEY`：对应的 base64 公钥。
 
-流水线核对版本、标签和密钥身份，所有包验证通过后创建草稿并发布；已有发布产物禁止覆盖。Release 包含 Linux/macOS 的 amd64/arm64 安装包、`SHA256SUMS`、`publisher.pub` 和 `release-metadata.json`，记录完整源码提交、兼容要求、发布者和产物摘要。导入前独立确认发布者信任。包内不包含商户配置、宿主订单授权或签名私钥。发布 Release 不会更新正在运行的 ZBoard 插件。
+流水线核对版本、标签和密钥身份，所有包验证通过后创建草稿并发布；发布构建不覆盖已有产物。Release 包含 Linux/macOS 的 amd64/arm64 安装包、`SHA256SUMS`、`publisher.pub` 和 `release-metadata.json`，记录完整源码提交、兼容要求、发布者和产物摘要。导入前独立确认发布者信任。包内不包含商户配置、宿主订单授权或签名私钥。发布 Release 不会更新正在运行的 ZBoard 插件。
+
+仓库所有者已批准 v0.0.1 的一次署名纠错：市场元数据流水线先将原始 `marketplace-entry.json` 和 `release-metadata.json` 按 SHA-256 命名归档，再仅将其中维护者从 `kovawx` 修正为 `zerodenet`。`scripts/correct_attribution.py` 固定原件摘要；安装包、签名、公钥、标签和产物摘要保持不变，其他元数据变更会被拒绝。
 
 ## 许可证
 

@@ -2,6 +2,8 @@
 
 [简体中文](README.zh-CN.md)
 
+Author and maintainer: [zerodenet](https://github.com/zerodenet). Signing publisher: `zerodenet`.
+
 ZBoard owns products, business orders, subscriptions, and entitlements. This plugin owns configurable payment channels, private payment attempts, provider checkout creation, server-side verification, and notification authentication. It submits a verified payment fact through the public native SDK; ZBoard performs the existing transactional fulfillment. A browser redirect is not payment evidence.
 
 ## Host integration
@@ -150,7 +152,9 @@ The package version remains `0.0.1`. Private data schema 2 reads existing schema
 - Variable `PLUGIN_PUBLISHER_ID`: the existing publisher identity.
 - Variable `PLUGIN_PUBLIC_KEY`: the corresponding base64 public key.
 
-The workflow validates version/tag agreement and key identity, then publishes a draft only after all packages verify. Published assets are never overwritten. Releases include Linux/macOS amd64/arm64 packages, `SHA256SUMS`, `publisher.pub` and `release-metadata.json` recording the full source commit, compatibility requirements, publisher and artifact hashes. Verify publisher trust independently before import. No merchant configuration, host order authority or private signing key is packaged. Publishing a release does not update a running ZBoard installation.
+The workflow validates version/tag agreement and key identity, then publishes a draft only after all packages verify. The release build never overwrites existing assets. Releases include Linux/macOS amd64/arm64 packages, `SHA256SUMS`, `publisher.pub` and `release-metadata.json` recording the full source commit, compatibility requirements, publisher and artifact hashes. Verify publisher trust independently before import. No merchant configuration, host order authority or private signing key is packaged. Publishing a release does not update a running ZBoard installation.
+
+The owner approved one attribution correction for v0.0.1: the marketplace workflow archives the exact original `marketplace-entry.json` and `release-metadata.json` under SHA-256-qualified names before correcting only their maintainer from `kovawx` to `zerodenet`. Original metadata digests are pinned in `scripts/correct_attribution.py`. The signed packages, signatures, key, tag and artifact hashes remain unchanged; other metadata changes are rejected.
 
 ## License
 
