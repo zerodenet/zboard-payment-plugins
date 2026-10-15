@@ -22,7 +22,7 @@ See the sibling host's `backend/pkg/pluginapi/v1/commerce.md` for the public SDK
 
 ## Channel configuration
 
-Import the signed offline package in ZBoard, grant its declared UI/slot, config, storage, public-route, order-read, and payment-write capabilities, then configure and enable the plugin. The running ZBoard build must include the commerce contract above and have a valid deployment `SiteURL` for trusted HTTPS returns.
+Import the signed offline package in ZBoard, grant its declared UI/slot, config, storage, public-route, background-task, order-read, and payment-write capabilities, then configure and enable the plugin. The running ZBoard build must include the commerce contract above and have a valid deployment `SiteURL` for trusted HTTPS returns.
 
 The plugin now declares an administrator configuration page (`settings`) that is available while disabled. It provides a shared “Add payment channel” action and a provider-type selector, with fields owned by registered provider adapters. TDCloud is the currently implemented adapter. Retained secrets, removal confirmation, and saved-configuration tests use the existing host configuration bridge. Advanced JSON configuration remains available.
 
@@ -54,21 +54,23 @@ Configuration reads omit `client_secret` and `notify_secret`. Saving those field
 
 ### Hosted cashier boundary
 
-TDCloud is one plugin payment option. The plugin never asks the administrator or consumer to choose a TDCloud internal payment-channel ID, and new collection requests omit `payment_no`. The cashier can initially return no selected method, then report its selected method in later order results. Lookup and notifications identify the TDCloud order by its merchant-authorized order number, external reference, invoice amount, currency and precision; a changing internal method ID is not an outer-order conflict.
+TDCloud is one plugin payment option. The plugin never asks the administrator or consumer to choose a TDCloud internal payment-channel ID, and new collection requests omit `payment_no`. The cashier can initially return no selected method, then report its selected method in later order results. Lookup and notifications identify the TDCloud order by its merchant-authorized order number, external reference, invoice amount and currency; a changing internal method ID is not an outer-order conflict.
 
-TDCloud owns invoice currencies and their precision; merchants must not define or copy those rules into this plugin. The configuration form does not contain invoice-unit fields. The intended source is TDCloud's authoritative merchant API, with the result pinned privately before first creation. A cashier method's currency is not the invoice currency catalogue.
+The formal TDCloud merchant contract accepts `amount` as an unsigned decimal string. New checkouts send `"amount": "15.00"` and the host's invoice currency, omitting both `amount_minor` and `payment_no`. TDCloud validates the currency, precision and limits and lets its hosted cashier choose the internal method. The plugin never queries or configures provider currency precision. The method directory checks merchant access and cashier availability only; internal method currencies and login requirements do not filter the outer business order. See [the adapter contract](docs/tdcloud-contract.md).
 
-Configuration testing checks merchant OAuth and cashier-directory access independently of payment readiness, without creating an order. The configuration page displays the last test result through the existing host configuration bridge while the plugin process remains running. Restarting the process or changing settings clears that result. Valid merchant access does not establish invoice metadata availability. Configuration loads never perform network probes, and diagnostic fields never persist as merchant configuration. Missing invoice metadata has a distinct setup error rather than a misleading transient retry.
+Configuration testing checks merchant OAuth and cashier-directory availability without creating an order. The page displays the running process's last test result through the existing configuration bridge. Restarting the process or changing settings clears that result. Configuration loads perform no network probes and diagnostic fields never persist as merchant settings. A successful connection check is not evidence of a completed payment.
 
-**Current limitation:** the inspected TDCloud merchant API exposes no pre-creation invoice currency catalogue. Its method directory does not return invoice precision, and its currency catalogue requires administrator access. Automatic metadata discovery is therefore not connected yet. A new connection can save credentials, but cannot publish a payment option or create an order until the authoritative source is available. Missing metadata never defaults to two decimals. See [the capability requirement](docs/tdcloud-invoice-currency-capability-requirement.md). Do not build a replacement delivery package until this dependency is resolved and the configuration-only path passes integration.
+### Decimal amounts and verification
 
-Earlier private test settings may contain `currencies`; they are decoded for compatibility but removed during active configuration normalization and hidden from the configuration editor. Existing attempts continue using their pinned `_amount` snapshot. These legacy fixture values do not verify automatic discovery. The retired `payment_no` is removed from new configuration; original attempts retain their idempotent request parameters.
+ZBoard supplies amounts in its known two-decimal units. The plugin formats `1500` as `"15.00"` using integer arithmetic; it does not convert this amount into TDCloud minor units. Responses and signed notifications use the authoritative decimal `amount`. Equivalent trailing zeros are accepted (`"10.50"` and `"10.50000000"`); missing text, invalid syntax, sub-cent fractions, overflow and mismatched amounts or currencies are rejected without rounding. TDCloud's derived `amount_minor` and `currency_decimals` do not drive the current protocol. A signature still triggers authenticated lookup before recording a payment fact.
 
-### Amount units and verification
+New private `_amount` snapshots pin wire version 2 and invoice currency. The attempt already pins the host amount, idempotency key and return/notification parameters. Retries after timeout, process restart, configuration changes or channel removal keep those values. Provider `invalid_amount`, `invalid_amount_precision` and `currency_unavailable` rejections release the attempt so another option can be selected; ambiguous failures and idempotency conflicts keep the original attempt.
 
-ZBoard amounts use two decimal places. TDCloud's authoritative invoice currency precision (0–8), verified against TDCloud's order response `currency_decimals`, determines its smallest unit; conversion uses checked integer arithmetic, never floating point or rounding. For example, a host amount of `1050` means 10.50 TDC and becomes `1050000000` at TDCloud's eight-decimal precision. JPY `1000` becomes `10` at zero-decimal precision. Fractions that cannot be represented or amounts exceeding TDCloud's `9007199254740991` smallest-unit limit are rejected before provider creation; the buyer can select another method.
+Existing version-1 or unversioned snapshots retain the exact historical integer request, original method binding and result-unit checks. The former conversion code is isolated in `tdcloud/legacy_amount.go` and is never selected for a new payment. Retired `currencies` and `payment_no` settings are stripped from active configuration and hidden from the editor. The former invoice-metadata requirement is [superseded by the decimal contract](docs/tdcloud-invoice-currency-capability-requirement.md).
 
-Currency and precision are saved privately before the first provider request. Ambiguous retries retain those units, the return/notification parameters, and the idempotency key, even after restart or a directory/configuration change. Creation responses must match the requested amount and precision. Lookup and signed notifications require explicit matching precision, normalize to host units, and match the saved amount, currency, channel, and order reference before recording a payment fact. A signed notification triggers authenticated lookup; it cannot settle an order by itself. Older attempts without saved precision only accept two-decimal results; other precisions fail closed to avoid reinterpreting previously sent amounts.
+### Optional checkout inputs
+
+Description is optional and omitted when blank; it is never used to work around provider-specific Stripe behavior. Optional description and return URL text is trimmed before transmission and response comparison, while business reference, amount, currency and idempotency identity remain strict. `expires_in` can be set in advanced channel settings: omit/null for TDCloud's 1800-second default, or use an integer from 60 to 7200. The attempt's private snapshot retains the original setting across restart and configuration edits. Existing snapshots with no expiry field remain compatible. HTTP 202 or a cashier-specific 403/422 does not prove payment or justify a replacement order; continue lookup of the original TDCloud order.
 
 ### Return and notifications
 
@@ -84,13 +86,17 @@ If no notification endpoint is configured, new checkouts explicitly send `notify
 
 ## Loading and retry behavior
 
+Before reopening a saved checkout past its provider-issued deadline, the plugin queries its authenticated payment status. A verified checkout expiry permits renewing the payment attempt and idempotency key on the same ZBoard order. A late verified payment completes that order instead. Unresolved results or lookup failures retain the original attempt and stop reopening the stale URL; the UI explains that the original payment is still being checked. Local time alone never releases an attempt.
+
+Expired order slots offer a one-shot original-payment inspection. The host verifies order ownership before the plugin reads its saved attempt and performs authenticated provider lookup. This action never creates an order, changes an attempt or records payment; it distinguishes the original provider state from the normalized payment state and classifies authorization/lookup failures without exposing credentials or cashier tokens. Business rejections use the public SDK `NewActionError` contract documented in ZBoard's `pluginapi/v1/actions.md`; older hosts safely degrade to generic errors.
+
 Method discovery runs concurrently with a four-second deadline. Complete results are cached for 60 seconds by configuration and currency; partial failures are not cached and do not hide healthy methods. The iframe displays concise loading/empty/failure states and supports local retry. The host owns the payment wait and confirm controls.
 
 Private storage contains attempts, provider-order references, and a bounded-key authority index. It uses host compare-and-swap revisions and retries brief lifecycle contention. Existing attempts restore the saved provider configuration after restart or removal from current configuration.
 
 ## Development checks
 
-Keep `zboard` and this repository in sibling directories; `go.mod` currently replaces the public SDK with `../zboard/backend/pkg/pluginapi`.
+The public SDK is pinned to ZBoard commit `505d0b728ea6d3fd78730326718b2446bdef9a7b` in `go.mod` and `go.sum`; unit tests need no sibling checkout. Packaging and the isolated host integration check use a separate ZBoard checkout. Set `ZBOARD_DIR` to its absolute path, or keep it in `../zboard`. CI checks out that exact host revision.
 
 ```sh
 go test ./...
@@ -100,7 +106,7 @@ node --test ui/*.test.mjs
 python3 scripts/check-host-integration.py
 ```
 
-The host integration check creates an isolated copy of committed ZBoard HEAD. It imports the actual signed plugin, configures a simulated TDCloud HTTPS service, exercises the public SDK, covers USD (2), TDC (8), and JPY (0), rejects conflicting lookup and signed notification fields, restarts the process, races confirmation against signed notification, and checks real host payment/subscription/credential records. Only the temporary test binary trusts the simulator certificate. It does not modify the ZBoard checkout, retain signing keys, or produce a deliverable offline package.
+The host integration check creates an isolated copy of committed ZBoard HEAD. It imports the actual signed plugin, configures a simulated TDCloud HTTPS service, exercises the public SDK, submits decimal amounts for USD, TDC and JPY with no configured provider precision, rejects conflicting lookup and signed notification fields, restarts the process, races confirmation against signed notification, and checks real host payment/subscription/credential records. Only the temporary test binary trusts the simulator certificate. It does not modify the ZBoard checkout, retain signing keys, or produce a deliverable offline package.
 
 ## Offline package
 
@@ -120,6 +126,28 @@ Keep the signing key for updates: replacing the publisher identity invalidates s
 
 ## Version and host compatibility
 
-The repository has not published a first code release. Its manifest, runtime and deliverable packages use **0.0.1**. Earlier local packages labelled 0.1.0/0.1.1 were temporary testing artifacts, not releases; replace them with the corrected 0.0.1 package.
+The first formal release is **v0.0.1**. Its manifest, runtime and deliverable packages use **0.0.1**. Earlier local packages labelled 0.1.0/0.1.1 were temporary testing artifacts, not releases; replace them with the corrected 0.0.1 package.
 
 ZBoard's lifecycle request mismatch is fixed in commit `abd9687`: its management page no longer sends the retired `version_id` field. Use a compatible running build containing that correction. The administrator configuration page works while the plugin is disabled. The [management requirement](docs/zboard-plugin-management-contract-requirement.md) remains as resolved issue history.
+
+## Late payments and financial review
+
+TDCloud may confirm `expired → paid` after a checkout deadline. Expiry ends the payment window; it does not permanently exclude a verified payment. Both signed notification hints and authenticated lookups reconcile the exact provider order, reference, currency and amount. Versioned lookups cannot roll back a newer status, and paid receipts are not erased by late expiry notifications.
+
+Every renewed attempt retains its complete private channel snapshot and provider-order index. Authenticated paid facts are persisted before the host call; an interrupted host response can be replayed with the same event identity after restart. Different paid attempts remain separate receipts. The first accepted fact fulfills the business order through ZBoard; additional payments or payments for closed orders enter the administrator **Payment review** page for refund/manual resolution. The plugin never automatically refunds or reopens a business order. ZBoard currently rejects a second different trade number on an already settled order; the additional receipt remains in plugin-owned storage and is visible for review rather than being dropped.
+
+The declared `reconcile-payments` task uses ZBoard's existing task scheduler every five minutes, scans at most 20 orders per run and checks at most 10 due provider attempts per order. Pending attempts are spaced by five minutes; expired attempts remain in daily historical reconciliation. Notifications and explicit confirmations bypass that interval. There is no private browser/background polling loop. The host must admit `zboard.task.v1` to run the fallback task.
+
+The package version remains `0.0.1`. Private data schema 2 reads existing schema-1 attempts and keeps complete new history; its empty host migration does not rewrite channel settings. The host prevents downgrading to an older reader after schema preparation. Pre-fix records that contain only historical IDs without frozen credentials are shown as **historical credentials missing**; the plugin cannot reconstruct discarded authority from current settings. Operators must reconcile those records through the owning provider.
+
+## GitHub Actions and releases
+
+`Checks` runs on pull requests and pushes to `master`: Go race tests, vet, browser-module tests, release validation, dependency-lock verification, the isolated host integration check and four signed development packages. Development artifacts use the disposable `payments-ci-dev` identity, expire after 14 days, and are for isolated testing only.
+
+`Release` runs for a `v*` tag, or manually with the matching tag. It reruns checks, requires the source commit to belong to `master`, and signs four platform packages in the `release` environment. Configure these environment values before publishing:
+
+- Secret `PLUGIN_SIGNING_KEY`: the existing base64 Ed25519 private key, supplied securely; never commit it.
+- Variable `PLUGIN_PUBLISHER_ID`: the existing publisher identity.
+- Variable `PLUGIN_PUBLIC_KEY`: the corresponding base64 public key.
+
+The workflow validates version/tag agreement and key identity, then publishes a draft only after all packages verify. Published assets are never overwritten. Releases include Linux/macOS amd64/arm64 packages, `SHA256SUMS`, `publisher.pub` and `release-metadata.json` recording the full source commit, compatibility requirements, publisher and artifact hashes. Verify publisher trust independently before import. No merchant configuration, host order authority or private signing key is packaged. Publishing a release does not update a running ZBoard installation.

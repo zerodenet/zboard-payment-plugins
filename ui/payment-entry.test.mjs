@@ -95,6 +95,82 @@ test("host presentation reports errors and collapses the iframe without a second
   assert.deepEqual(sizes, [0]);
   entry.destroy();
 });
+
+test("expired order shows an inspection control without creating or settling orders", async () => {
+  const h = host({ orderId: 42 });
+  const request = h.bridge.request;
+  const sizes = [];
+  h.bridge.resize = height => sizes.push(height);
+  h.bridge.request = async (type, input) => {
+    if (type === "checkout.context") return { currency: "USD", currency_precision: 2, order_id: 42, presentation: "host" };
+    if (input?.action === "payments.methods") return { data: [{ id: "tdcloud", name: "TDCloud", currency: "USD", checkout_expires_at: new Date(Date.now() - 1000).toISOString() }] };
+    return request(type, input);
+  };
+  const container = root();
+  const entry = await mountPaymentEntry(container, { bridge: h.bridge });
+  assert.equal(entry.getState().phase, "ready");
+  assert.equal(container.hidden, false);
+  assert.match(container.children[0].textContent, /窗口已超时.*确认过期后/);
+  assert.ok(sizes.at(-1) > 0);
+  assert.equal(container.find(node => node.tagName === "button").textContent, "检查原收款状态");
+  assert.equal(h.calls.some(call => call.input?.action === "payments.prepare"), false);
+  assert.equal(h.published[0][0].disabled, false);
+  entry.destroy();
+});
+
+test("inspection displays authenticated review state without starting or confirming payment", async () => {
+  const h = host({ orderId: 42 }); const request = h.bridge.request;
+  const container = root();
+  h.bridge.request = async (type, input) => {
+    if (input?.action === "payments.inspect") {
+      h.calls.push({ type, input });
+      return { data: { order_id: 42, provider_order_id: "mp-42", provider_state: "review", state: "unknown", checked_at: "2026-10-14T06:00:00Z" } };
+    }
+    return request(type, input);
+  };
+  const entry = await mountPaymentEntry(container, { bridge: h.bridge });
+  await entry.inspect();
+  assert.match(container.children[0].textContent, /复核原收款/);
+  assert.equal(container.children[0].attributes["data-provider-state"], "review");
+  assert.equal(container.children[0].attributes["data-provider-order"], "mp-42");
+  assert.equal(h.calls.filter(c => c.input?.action === "payments.inspect").length, 1);
+  assert.equal(h.calls.some(c => ["payments.prepare", "payments.reconcile"].includes(c.input?.action)), false);
+  entry.destroy();
+});
+
+test("inspection classifies access rejection and never labels it as expiry", async () => {
+  const h = host({ orderId: 42 }); const request = h.bridge.request;
+  h.bridge.request = async (type, input) => input?.action === "payments.inspect"
+    ? { error: { code: "provider_access_denied" } } : request(type, input);
+  const container = root(); const entry = await mountPaymentEntry(container, { bridge: h.bridge });
+  await entry.inspect();
+  assert.match(container.children[0].textContent, /拒绝查询/);
+  assert.equal(container.children[0].attributes["data-inspection-error"], "provider_access_denied");
+  assert.doesNotMatch(container.children[0].textContent, /已确认过期/);
+  entry.destroy();
+});
+
+test("checkout deadline notice is scheduled locally and canceled on destruction", async () => {
+  const h = host({ orderId: 42 }); const request = h.bridge.request;
+  let timerCallback, canceled = false;
+  const container = root();
+  container.ownerDocument.defaultView = {
+    addEventListener: () => {}, removeEventListener: () => {},
+    setTimeout: (callback) => { timerCallback = callback; return 17; },
+    clearTimeout: id => { canceled = id === 17; },
+  };
+  h.bridge.request = async (type, input) => {
+    if (type === "checkout.context") return { currency: "USD", currency_precision: 2, order_id: 42, presentation: "host" };
+    if (input?.action === "payments.methods") return { data: [{ id: "tdcloud", name: "TDCloud", currency: "USD", checkout_expires_at: new Date(Date.now() + 60_000).toISOString() }] };
+    return request(type, input);
+  };
+  const entry = await mountPaymentEntry(container, { bridge: h.bridge });
+  assert.equal(container.hidden, true);
+  timerCallback();
+  assert.equal(container.hidden, false);
+  entry.destroy();
+  assert.equal(canceled, true);
+});
 test("missing provider metadata remains a specific unavailable reason and publishes no payment options", async () => {
   const h = host(); const request = h.bridge.request;
   const statuses = [];

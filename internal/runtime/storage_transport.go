@@ -14,10 +14,10 @@ import (
 func retryStorage(ctx context.Context, call func() (pluginv1.StoredValue, error)) (pluginv1.StoredValue, error) {
 	for attempt := 0; ; attempt++ {
 		value, err := call()
-		if err == nil || !strings.HasSuffix(err.Error(), "(HTTP 503)") || attempt == 2 {
+		if err == nil || !strings.HasSuffix(err.Error(), "(HTTP 503)") || attempt == 5 {
 			return value, err
 		}
-		timer := time.NewTimer(time.Duration(attempt+1) * 50 * time.Millisecond)
+		timer := time.NewTimer(time.Duration(1<<attempt) * 50 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()

@@ -15,6 +15,7 @@ export function createPaymentFlow(ports, onChange = () => {}) {
   };
 
   const failureMessage = (error, fallback) => {
+    if (error?.code === "checkout_expiry_pending") return "支付窗口已超时，渠道仍在核对原收款结果；请稍后重试";
     if (error?.code === "provider_metadata_missing") return "支付渠道接入尚未完成，请联系管理员";
     if (error?.code === "host_capability_missing") return "支付功能尚未开放，请稍后从订单页重试";
     if (["session_unavailable", "bridge_unavailable", "permission_denied"].includes(error?.code)) return "支付会话不可用，请重新进入订单页";

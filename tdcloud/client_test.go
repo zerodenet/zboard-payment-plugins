@@ -32,16 +32,17 @@ func TestMerchantPaymentCreateAndLookup(t *testing.T) {
 				ReturnURL     string `json:"return_url"`
 				NotifyEnabled *bool  `json:"notify_enabled"`
 				Key           string `json:"idempotency_key"`
-				Amount        int64  `json:"amount_minor"`
+				Amount        string `json:"amount"`
+				Minor         *int64 `json:"amount_minor"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Reference != "zboard-7" || request.Description != "Monthly plan" || request.ReturnURL != "https://panel.example.test/orders/7" || request.Key != "fixed-key" || request.Amount != 1200 || request.NotifyEnabled == nil || *request.NotifyEnabled {
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Reference != "zboard-7" || request.Description != "Monthly plan" || request.ReturnURL != "https://panel.example.test/orders/7" || request.Key != "fixed-key" || request.Amount != "12.00" || request.Minor != nil || request.NotifyEnabled == nil || *request.NotifyEnabled {
 				t.Errorf("invalid create request: %+v, %v", request, err)
 			}
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: request.Reference, ReturnURL: request.ReturnURL, PaymentNo: "stripe-1", AmountMinor: 1200,
+			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: request.Reference, ReturnURL: request.ReturnURL, PaymentNo: "stripe-1", Amount: "12.00", AmountMinor: 1200,
 				Currency: "CNY", CurrencyDecimals: intPointer(2), Status: "pending", CheckoutURL: "https://checkout.example.test/1", ExpiresAt: time.Now().Add(time.Hour)})
 		case "/openapi/v1/merchant-payments/mp123":
-			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zboard-7", PaymentNo: "stripe-1", AmountMinor: 1200,
+			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zboard-7", PaymentNo: "stripe-1", Amount: "12.00", AmountMinor: 1200,
 				Currency: "CNY", CurrencyDecimals: intPointer(2), Status: "paid", EventID: "event-1", ProviderTradeNo: "cs-1", OccurredAt: time.Now().UTC()})
 		case "/openapi/v1/merchant-payment-channels":
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []MerchantChannel{{PaymentNo: "stripe-1", Currency: "CNY", CurrencyDecimals: intPointer(2)}}})
@@ -50,7 +51,7 @@ func TestMerchantPaymentCreateAndLookup(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New("tdcloud", server.URL, "client", "secret", map[string]int{"CNY": 2, "USD": 2}, server.Client())
+	client, err := New("tdcloud", server.URL, "client", "secret", server.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +87,7 @@ func TestExplicitNotificationSettingsAreSentWithCheckout(t *testing.T) {
 				t.Errorf("notification settings not sent: %+v", request)
 			}
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zb-7", PaymentNo: "stripe-1", AmountMinor: 1200,
+			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zb-7", PaymentNo: "stripe-1", Amount: "12.00", AmountMinor: 1200,
 				Currency: "CNY", CurrencyDecimals: intPointer(2), Status: "pending", CheckoutURL: "https://checkout.example.test/1", ExpiresAt: time.Now().Add(time.Hour)})
 		default:
 			http.NotFound(w, r)
@@ -162,7 +163,7 @@ func TestLegacyCheckoutSnapshotKeepsOmittedNotificationChoice(t *testing.T) {
 			_ = json.NewDecoder(r.Body).Decode(&createBody)
 			createBodies <- createBody
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zb-7", PaymentNo: "stripe-1", AmountMinor: 1200,
+			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zb-7", PaymentNo: "stripe-1", Amount: "12.00", AmountMinor: 1200,
 				Currency: "CNY", CurrencyDecimals: intPointer(2), Status: "pending", CheckoutURL: "https://checkout.example.test/1", ExpiresAt: time.Now().Add(time.Hour)})
 		default:
 			http.NotFound(w, r)
@@ -199,13 +200,13 @@ func TestCheckoutRejectsUnexpectedReturnURL(t *testing.T) {
 		case "/openapi/v1/merchant-payments":
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zboard-7", ReturnURL: "https://wrong.example.test/orders/7",
-				PaymentNo: "stripe-1", AmountMinor: 1200, Currency: "CNY", CurrencyDecimals: intPointer(2), Status: "pending", CheckoutURL: "https://checkout.example.test/1", ExpiresAt: time.Now().Add(time.Hour)})
+				PaymentNo: "stripe-1", Amount: "12.00", AmountMinor: 1200, Currency: "CNY", CurrencyDecimals: intPointer(2), Status: "pending", CheckoutURL: "https://checkout.example.test/1", ExpiresAt: time.Now().Add(time.Hour)})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
-	client, err := New("tdcloud", server.URL, "client", "secret", map[string]int{"CNY": 2, "USD": 2}, server.Client())
+	client, err := New("tdcloud", server.URL, "client", "secret", server.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,10 +235,10 @@ func TestMerchantPaymentStatesAndErrors(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "payment_conflict"})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zboard-7", PaymentNo: "stripe-1", AmountMinor: 1200,
+			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zboard-7", PaymentNo: "stripe-1", Amount: "12.00", AmountMinor: 1200,
 				Currency: "CNY", CurrencyDecimals: intPointer(2), Status: state.Load().(string), CheckoutURL: "https://checkout.example.test/1", ExpiresAt: time.Now().Add(-time.Minute)})
 		case "/openapi/v1/merchant-payments/mp123":
-			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zboard-7", PaymentNo: "stripe-1", AmountMinor: 1200,
+			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp123", ExternalRef: "zboard-7", PaymentNo: "stripe-1", Amount: "12.00", AmountMinor: 1200,
 				Currency: "CNY", CurrencyDecimals: intPointer(2), Status: state.Load().(string)})
 		case "/openapi/v1/merchant-payment-channels":
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []MerchantChannel{{PaymentNo: "other", Currency: "CNY", CurrencyDecimals: intPointer(2)}}})
@@ -246,7 +247,7 @@ func TestMerchantPaymentStatesAndErrors(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New("tdcloud", server.URL, "client", "secret", map[string]int{"CNY": 2, "USD": 2}, server.Client())
+	client, err := New("tdcloud", server.URL, "client", "secret", server.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,8 +266,8 @@ func TestMerchantPaymentStatesAndErrors(t *testing.T) {
 		t.Fatalf("review cannot settle: %+v %v", result, err)
 	}
 	state.Store("expired")
-	if _, err := client.CreateCheckout(t.Context(), request); !errors.Is(err, payment.ErrCheckoutFailed) {
-		t.Fatalf("verified expiry is terminal: %v", err)
+	if checkout, err := client.CreateCheckout(t.Context(), request); err != nil || checkout.Status != "failed" || checkout.ProviderOrderID != "mp123" {
+		t.Fatalf("expired checkout identity must remain reconcilable: %+v %v", checkout, err)
 	}
 	result, err = client.Lookup(t.Context(), "mp123")
 	if err != nil || result.Status != "failed" {

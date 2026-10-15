@@ -105,10 +105,10 @@ func TestProcessStorageAndAuthenticatedActionsResumeAfterRestart(t *testing.T) {
 		case "/openapi/v1/merchant-payments":
 			creates.Add(1)
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "stripe-usd", "return_url": "https://board.example/orders/42", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "pending", "checkout_url": "https://pay.example/42", "expires_at": time.Now().Add(time.Hour)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "stripe-usd", "return_url": "https://board.example/orders/42", "amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "pending", "checkout_url": "https://pay.example/42", "expires_at": time.Now().Add(time.Hour)})
 		case "/openapi/v1/merchant-payments/mp-42":
 			lookups.Add(1)
-			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "stripe-usd", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "paid", "event_id": "event-42", "provider_trade_no": "trade-42", "occurred_at": occurred})
+			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "stripe-usd", "amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "paid", "event_id": "event-42", "provider_trade_no": "trade-42", "occurred_at": occurred})
 		default:
 			http.NotFound(w, r)
 		}
@@ -138,12 +138,6 @@ func TestProcessStorageAndAuthenticatedActionsResumeAfterRestart(t *testing.T) {
 	if _, err := s.ApplyConfig(t.Context(), &pluginv1.ConfigRequest{ConfigJson: cfg}); err != nil {
 		t.Fatal(err)
 	}
-	if result := action(t, s, "buyer", "payments.methods", `{"currency":"USD"}`); result.Error == nil || creates.Load() != 0 {
-		t.Fatal("manual settings must not make a production connection payment-ready")
-	}
-	// Inject known legacy metadata only into this storage/coordinator fixture.
-	// Automatic discovery is separately blocked by the production config path.
-	useLegacyFixtureConfig(s, config{Channels: []channelConfig{{ID: "tdcloud", Name: "TDCloud", Type: "tdcloud", Enabled: true, Settings: settings}}})
 	if result := action(t, s, "buyer", "payments.methods", `{"currency":"USD"}`); result.Error != nil {
 		t.Fatalf("methods: %+v", result)
 	}

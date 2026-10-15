@@ -13,7 +13,7 @@ import tarfile
 import tempfile
 
 plugin_root = Path(__file__).resolve().parent.parent
-board_root = plugin_root.parent / "zboard"
+board_root = Path(os.environ.get("ZBOARD_DIR", str(plugin_root.parent / "zboard"))).resolve()
 revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=board_root, text=True).strip()
 print(f"Checking plugin against committed ZBoard {revision}", flush=True)
 archive = subprocess.check_output(["git", "archive", revision], cwd=board_root)

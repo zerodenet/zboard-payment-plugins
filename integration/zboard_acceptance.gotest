@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -76,7 +77,7 @@ func actualPaymentsPackage(t *testing.T, pub ed25519.PublicKey, key ed25519.Priv
 		t.Fatal(err)
 	}
 	files := map[string][]byte{executable: payload}
-	for _, name := range []string{"payment.html", "payment-entry.mjs", "plugin-bridge.mjs", "payment-widget.mjs", "payment-flow.mjs", "config.html", "config-entry.mjs", "channel-config-providers.mjs", "tdcloud-config.mjs"} {
+	for _, name := range []string{"payment.html", "payment-entry.mjs", "plugin-bridge.mjs", "payment-widget.mjs", "payment-flow.mjs", "config.html", "config-entry.mjs", "reviews-entry.mjs", "channel-config-providers.mjs", "tdcloud-config.mjs"} {
 		data, err := os.ReadFile(filepath.Join(root, "ui", name))
 		if err != nil {
 			t.Fatal(err)
@@ -135,8 +136,24 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 	if order.PayableAmount != scenario.hostMinor || order.Currency != scenario.currency {
 		t.Fatalf("fixture amount: %+v", order)
 	}
+	invoiceText := fmt.Sprintf("%d.%02d", scenario.hostMinor/100, scenario.hostMinor%100)
+	responseText := invoiceText
+	if scenario.decimals == 0 {
+		responseText = strings.TrimSuffix(invoiceText, ".00")
+	}
+	if scenario.decimals > 2 {
+		responseText += strings.Repeat("0", scenario.decimals-2)
+	}
+	var lookupText atomic.Value
+	lookupText.Store(responseText)
 	var paid atomic.Bool
+	var expired atomic.Bool
+	var secondPaid atomic.Bool
 	var creates atomic.Int32
+	var createMu sync.Mutex
+	var createParameters []byte
+	var secondParameters []byte
+	var expiresAt time.Time
 	var directoryDecimals atomic.Int32
 	directoryDecimals.Store(int32(scenario.decimals))
 	var lookupDecimals atomic.Int32
@@ -155,30 +172,72 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{"payment_no": "test-channel", "currency": order.Currency, "currency_decimals": directoryDecimals.Load()}}})
 		case "/openapi/v1/merchant-payments":
 			var in struct {
-				PaymentNo *string `json:"payment_no"`
-				Amount    int64   `json:"amount_minor"`
-				Reference string  `json:"external_reference"`
-				Return    string  `json:"return_url"`
-				Notify    string  `json:"notify_url"`
+				PaymentNo     *string `json:"payment_no"`
+				Amount        string  `json:"amount"`
+				Minor         *int64  `json:"amount_minor"`
+				Reference     string  `json:"external_reference"`
+				Return        string  `json:"return_url"`
+				Notify        string  `json:"notify_url"`
+				Secret        string  `json:"notify_secret"`
+				NotifyEnabled *bool   `json:"notify_enabled"`
+				Expiry        *int64  `json:"expires_in"`
+				Description   string  `json:"description"`
+				Key           string  `json:"idempotency_key"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&in)
-			if in.PaymentNo != nil || in.Amount != scenario.providerMinor || in.Reference != order.TradeNo || !strings.Contains(in.Return, "payment_plugin=zboard.payments") || !strings.Contains(in.Return, fmt.Sprintf("payment_order=%d", order.ID)) || in.Notify == "" {
+			if in.PaymentNo != nil || in.Amount != invoiceText || in.Minor != nil || in.Reference != order.TradeNo || !strings.Contains(in.Return, "payment_plugin=zboard.payments") || !strings.Contains(in.Return, fmt.Sprintf("payment_order=%d", order.ID)) || in.Notify != "" || in.Secret != "" || in.NotifyEnabled == nil || !*in.NotifyEnabled || in.Key == "" {
 				t.Errorf("trusted checkout mismatch: %+v", in)
 			}
-			creates.Add(1)
-			w.WriteHeader(201)
-			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "merchant-order-1", "external_reference": in.Reference, "return_url": in.Return, "payment_no": "", "amount_minor": in.Amount, "currency": order.Currency, "currency_decimals": scenario.decimals, "status": "pending", "checkout_url": "https://cashier.example.test/1", "expires_at": time.Now().Add(time.Hour)})
-		case "/openapi/v1/merchant-payments/merchant-order-1":
-			status := "pending"
-			if paid.Load() {
-				status = "paid"
+			in.Description, in.Return = strings.TrimSpace(in.Description), strings.TrimSpace(in.Return)
+			seconds := int64(1800)
+			if in.Expiry != nil {
+				seconds = *in.Expiry
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "merchant-order-1", "external_reference": order.TradeNo, "payment_no": func() string {
-				if paid.Load() {
-					return "chosen-by-tdcloud"
+			if seconds < 60 || seconds > 7200 {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid_expires_in"})
+				return
+			}
+			in.Expiry = &seconds
+			parameters, _ := json.Marshal(in)
+			createMu.Lock()
+			defer createMu.Unlock()
+			providerID, cashierID := "merchant-order-1", "1"
+			if createParameters != nil && !bytes.Equal(parameters, createParameters) {
+				if !expired.Load() || (secondParameters != nil && !bytes.Equal(parameters, secondParameters)) {
+					w.WriteHeader(409)
+					json.NewEncoder(w).Encode(map[string]string{"error": "payment_conflict"})
+					return
 				}
-				return ""
-			}(), "amount_minor": lookupAmount.Load(), "currency": lookupCurrency.Load(), "currency_decimals": lookupDecimals.Load(), "status": status, "event_id": "provider-paid-1", "provider_trade_no": "provider-trade-1", "occurred_at": occurred})
+				if secondParameters == nil {
+					secondParameters = parameters
+					creates.Add(1)
+				}
+				providerID, cashierID = "merchant-order-2", "2"
+			}
+			if createParameters == nil {
+				createParameters = parameters
+				expiresAt = time.Now().Add(time.Duration(seconds) * time.Second)
+				creates.Add(1)
+			}
+			w.WriteHeader(201)
+			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": providerID, "external_reference": in.Reference, "return_url": in.Return, "payment_no": "", "amount": responseText, "amount_minor": scenario.providerMinor, "currency": order.Currency, "currency_decimals": scenario.decimals, "status": "pending", "checkout_url": "https://cashier.example.test/" + cashierID, "expires_at": expiresAt})
+		case "/openapi/v1/merchant-payments/merchant-order-1", "/openapi/v1/merchant-payments/merchant-order-2":
+			providerID := path.Base(r.URL.Path)
+			isPaid := paid.Load()
+			version := 1
+			remoteState := "pending"
+			if providerID == "merchant-order-2" {
+				isPaid = secondPaid.Load()
+			} else if expired.Load() {
+				remoteState, version = "expired", 2
+			}
+			if isPaid {
+				remoteState, version = "paid", 3
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": providerID, "external_reference": order.TradeNo, "payment_no": "chosen-by-tdcloud",
+				"amount": lookupText.Load(), "amount_minor": lookupAmount.Load(), "currency": lookupCurrency.Load(), "currency_decimals": lookupDecimals.Load(), "status": remoteState, "status_version": version,
+				"event_id": "provider-paid-" + providerID, "provider_trade_no": "provider-trade-" + providerID, "occurred_at": occurred})
 		default:
 			http.NotFound(w, r)
 		}
@@ -204,7 +263,7 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := json.Marshal(map[string]any{"channels": []any{map[string]any{"id": "tdcloud-main", "name": "TDCloud test", "type": "tdcloud", "enabled": true, "settings": map[string]any{"currencies": map[string]int{scenario.currency: scenario.decimals}, "api_url": provider.URL, "client_id": "merchant", "client_secret": "merchant-test-secret", "notify_url": "https://panel.example.test/.well-known/zboard-payments/v1/tdcloud-notify", "notify_secret": notifySecret}}}})
+	cfg, _ := json.Marshal(map[string]any{"channels": []any{map[string]any{"id": "tdcloud-main", "name": "TDCloud test", "type": "tdcloud", "enabled": true, "settings": map[string]any{"api_url": provider.URL, "client_id": "merchant", "client_secret": "merchant-test-secret", "notify_mode": "merchant_default", "notify_enabled": true, "notify_url": "https://panel.example.test/.well-known/zboard-payments/v1/tdcloud-notify", "notify_secret": notifySecret}}}})
 	revision, err := manager.ConfigRevision(installation.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +288,7 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 		f.h.PluginBridgeHandler(out, r)
 		return out
 	}
-	for _, name := range []string{"config.html", "config-entry.mjs", "channel-config-providers.mjs", "tdcloud-config.mjs", "plugin-bridge.mjs"} {
+	for _, name := range []string{"config.html", "config-entry.mjs", "reviews-entry.mjs", "channel-config-providers.mjs", "tdcloud-config.mjs", "plugin-bridge.mjs"} {
 		r := httptest.NewRequest("GET", "https://panel.example.test/api/v1/plugin-assets/"+configSession.Token+"/ui/"+name, nil)
 		out := httptest.NewRecorder()
 		f.h.PluginAssetHandler(out, r)
@@ -303,6 +362,10 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 	if err != nil || !strings.Contains(string(prepared), `"checkout_url":"https://cashier.example.test/1"`) {
 		t.Fatalf("prepare: %s %v", prepared, err)
 	}
+	inspection, err := manager.SessionPageAction(t.Context(), session.Token, 1, true, "payments.inspect", json.RawMessage(fmt.Sprintf(`{"order_id":%q}`, strconv.FormatUint(uint64(order.ID), 10))))
+	if err != nil || !strings.Contains(string(inspection), `"provider_state":"pending"`) || strings.Contains(string(inspection), `"error"`) || creates.Load() != 1 {
+		t.Fatalf("owned read-only provider inspection: %s %v", inspection, err)
+	}
 	if _, err := manager.SessionCheckoutAction(t.Context(), session.Token, 1, true, order.ID, "payments.prepare", json.RawMessage(`{"option_id":"tdcloud-main","amount_minor":1}`)); err == nil {
 		t.Fatal("browser amount accepted")
 	}
@@ -321,19 +384,22 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 		t.Fatalf("restart duplicate checkout: %v creates=%d", err, creates.Load())
 	}
 	paid.Store(true)
-	// Authenticated lookup results must preserve the saved amount, currency and precision.
-	for _, bad := range []string{"amount", "currency", "precision"} {
+	// Authenticated lookup must preserve decimal invoice amount and currency.
+	for _, bad := range []string{"amount", "currency", "missing amount", "fractional cents"} {
 		switch bad {
 		case "amount":
-			lookupAmount.Store(scenario.providerMinor + 1)
+			lookupText.Store(fmt.Sprintf("%d.%02d", (scenario.hostMinor+1)/100, (scenario.hostMinor+1)%100))
 		case "currency":
 			lookupCurrency.Store("ZZZ")
-		case "precision":
-			lookupDecimals.Store(int32((scenario.decimals + 1) % 9))
+		case "missing amount":
+			lookupText.Store("")
+		case "fractional cents":
+			lookupText.Store("10.50000001")
 		}
 		if _, err := manager.SessionCheckoutAction(t.Context(), orderSession.Token, 1, true, order.ID, "payments.reconcile", payload); err == nil {
 			t.Fatalf("accepted conflicting lookup %s", bad)
 		}
+		lookupText.Store(responseText)
 		lookupAmount.Store(scenario.providerMinor)
 		lookupCurrency.Store(scenario.currency)
 		lookupDecimals.Store(int32(scenario.decimals))
@@ -343,7 +409,25 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 	if unpaidEvents != 0 {
 		t.Fatal("conflicting lookup recorded payment")
 	}
-	event, _ := json.Marshal(map[string]any{"id": "notification-1", "type": "merchant_payment.status_changed", "api_version": 1, "created_at": occurred, "data": map[string]any{"order_no": "merchant-order-1", "external_reference": order.TradeNo, "payment_no": "selected-inside-cashier", "amount_minor": scenario.providerMinor, "currency": order.Currency, "currency_decimals": scenario.decimals, "status": "paid", "status_version": 2, "event_id": "provider-paid-1"}})
+	if scenario.currency == "USD" {
+		paid.Store(false)
+		expired.Store(true)
+		if _, err := manager.SessionCheckoutAction(t.Context(), orderSession.Token, 1, true, order.ID, "payments.reconcile", payload); err != nil {
+			t.Fatal(err)
+		}
+		prepared, err := manager.SessionCheckoutAction(t.Context(), orderSession.Token, 1, true, order.ID, "payments.prepare", payload)
+		if err != nil || !strings.Contains(string(prepared), "https://cashier.example.test/2") || creates.Load() != 2 {
+			t.Fatalf("same business order renewal: %s %v", prepared, err)
+		}
+		manager.Close()
+		manager = newManager()
+		orderSession, err = manager.CreateSlotSession(installation.ID, "order-payment", plugins.OrderPaymentSlot, "account", 1, true, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paid.Store(true)
+	}
+	event, _ := json.Marshal(map[string]any{"id": "notification-1", "type": "merchant_payment.status_changed", "api_version": 1, "created_at": occurred, "data": map[string]any{"order_no": "merchant-order-1", "external_reference": order.TradeNo, "payment_no": "selected-inside-cashier", "amount": responseText, "amount_minor": scenario.providerMinor, "currency": order.Currency, "currency_decimals": scenario.decimals, "status": "paid", "status_version": 3, "event_id": "provider-paid-merchant-order-1"}})
 	deliver := func(body []byte) *httptest.ResponseRecorder {
 		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 		mac := hmac.New(sha256.New, []byte(notifySecret))
@@ -359,21 +443,21 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 		return out
 	}
 	// Even correctly signed notifications must match the saved attempt.
-	for _, field := range []string{"amount_minor", "currency", "currency_decimals", "external_reference", "missing precision"} {
+	for _, field := range []string{"amount", "currency", "fractional cents", "external_reference", "missing amount"} {
 		var bad map[string]any
 		_ = json.Unmarshal(event, &bad)
 		data := bad["data"].(map[string]any)
 		switch field {
-		case "amount_minor":
-			data[field] = scenario.providerMinor + 1
+		case "amount":
+			data[field] = "999.99"
 		case "currency":
 			data[field] = "ZZZ"
-		case "currency_decimals":
-			data[field] = (scenario.decimals + 1) % 9
+		case "fractional cents":
+			data["amount"] = "10.50000001"
 		case "external_reference":
 			data[field] = "other-order"
-		case "missing precision":
-			delete(data, "currency_decimals")
+		case "missing amount":
+			delete(data, "amount")
 		}
 		body, _ := json.Marshal(bad)
 		out := deliver(body)
@@ -419,6 +503,34 @@ func actualPaymentsPluginClosesHostOrder(t *testing.T, scenario precisionCase) {
 		var count int64
 		if err := f.h.db.Table(table).Count(&count).Error; err != nil || count != want {
 			t.Fatalf("%s=%d: %v", table, count, err)
+		}
+	}
+	if scenario.currency == "USD" {
+		secondPaid.Store(true)
+		var extra map[string]any
+		_ = json.Unmarshal(event, &extra)
+		extra["data"].(map[string]any)["order_no"] = "merchant-order-2"
+		extra["data"].(map[string]any)["event_id"] = "provider-paid-merchant-order-2"
+		extraBody, _ := json.Marshal(extra)
+		for range 2 {
+			if out := deliver(extraBody); out.Code != 200 {
+				t.Fatalf("second payment fact lost: %d %s", out.Code, out.Body.String())
+			}
+		}
+		reviewSession, err := manager.CreateSession(installation.ID, "payment-reviews", "admin", 1, true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reviews, err := manager.SessionPageAction(t.Context(), reviewSession.Token, 1, true, "payments.reviews", json.RawMessage(`{"offset":0,"limit":20}`))
+		if err != nil || !strings.Contains(string(reviews), "provider-paid-merchant-order-2") || !strings.Contains(string(reviews), "additional_payment") || strings.Contains(string(reviews), notifySecret) {
+			t.Fatalf("verified duplicate receipt missing from admin review: %s %v", reviews, err)
+		}
+		for _, table := range []string{"payment_events", "subscriptions", "protocol_credentials"} {
+			var n int64
+			f.h.db.Table(table).Count(&n)
+			if n != 1 {
+				t.Fatalf("extra payment repeated %s: %d", table, n)
+			}
 		}
 	}
 	manager.RevokeSession(orderSession.Token, 1)

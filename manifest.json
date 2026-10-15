@@ -15,15 +15,20 @@
     "zboard.config.v1",
     "zboard.storage.v1",
     "zboard.http.route.v1",
+    "zboard.task.v1",
     "zboard.commerce.orders.read.v1",
     "zboard.commerce.payments.write.v1"
   ],
   "data": {
-    "version": 1,
+    "version": 2,
     "min_compatible_version": 1,
     "migrations": [
       {
         "version": 1,
+        "changes": []
+      },
+      {
+        "version": 2,
         "changes": []
       }
     ]
@@ -53,6 +58,12 @@
         "surface": "admin",
         "title": "支付渠道配置",
         "purpose": "configuration"
+      },
+      {
+        "id": "payment-reviews",
+        "surface": "admin",
+        "title": "付款核对",
+        "purpose": "business"
       }
     ],
     "http_routes": [
@@ -76,6 +87,14 @@
         "slot": "account.orders.payment",
         "title": "支付通道",
         "entrypoint": "ui/payment.html"
+      }
+    ],
+    "tasks": [
+      {
+        "id": "reconcile-payments",
+        "title": "支付尝试定期对账",
+        "interval_seconds": 300,
+        "timeout_seconds": 45
       }
     ]
   },

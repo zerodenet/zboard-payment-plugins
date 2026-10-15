@@ -13,6 +13,9 @@ var (
 	ErrConflict                    = errors.New("payment attempt conflicts with order or channel")
 	ErrPending                     = errors.New("payment creation is pending; retry with the same idempotency key")
 	ErrCheckoutFailed              = errors.New("provider checkout has definitively failed")
+	ErrCheckoutExpiryPending       = errors.New("checkout deadline passed; provider result is not yet final")
+	ErrFactNeedsReview             = errors.New("verified payment requires manual resolution")
+	ErrHistoricalUnavailable       = errors.New("historical payment credentials are unavailable")
 	// ErrAmountPrecision guarantees rejection before any provider order is created.
 	ErrAmountPrecision = errors.New("payment amount cannot be represented exactly")
 )
@@ -42,7 +45,8 @@ type Checkout struct {
 	ProviderOrderID string
 	RedirectURL     string
 	ExpiresAt       time.Time
-	Status          string // pending, review, or paid on an idempotent retry
+	Status          string // pending, review, paid, or failed on an idempotent retry
+	StatusVersion   uint64
 }
 
 // PaymentResult is obtained through an authenticated server-to-server lookup.
@@ -53,6 +57,8 @@ type PaymentResult struct {
 	ProviderTradeNo string
 	EventID         string
 	Status          string // pending, paid, failed, unknown, or reversed
+	StatusVersion   uint64
+	ProviderState   string // original provider state for an authenticated, owned inspection
 	AmountMinor     int64
 	Currency        string
 	OccurredAt      time.Time
@@ -85,7 +91,16 @@ type Attempt struct {
 	State           string    `json:"state"` // creating, pending, paid, failed, review
 	AttemptNumber   uint64    `json:"attempt_number"`
 	PreviousOrders  []string  `json:"previous_orders,omitempty"`
-	Revision        uint64    `json:"revision"`
+	// History contains flat, complete snapshots, including verified receipts.
+	// Expiry permits a new attempt; it does not discard the old payment authority.
+	History         []Attempt    `json:"history,omitempty"`
+	ProviderVersion uint64       `json:"provider_version,omitempty"`
+	VerifiedFact    *PaymentFact `json:"verified_fact,omitempty"`
+	FactState       string       `json:"fact_state,omitempty"` // pending, recorded, review
+	ReviewReason    string       `json:"review_reason,omitempty"`
+	NextCheckAt     time.Time    `json:"next_check_at,omitempty"`
+	SettledProvider string       `json:"settled_provider,omitempty"`
+	Revision        uint64       `json:"revision"`
 }
 
 type Channel interface {
@@ -98,6 +113,11 @@ type Channel interface {
 // ConnectionProbe verifies merchant access without creating an order.
 type ConnectionProbe interface {
 	Probe(context.Context) error
+}
+
+// LookupDiagnostic exposes a fixed public category, never a raw provider error.
+type LookupDiagnostic interface {
+	LookupProblem(error) string
 }
 
 // SnapshotChannel optionally freezes provider-owned metadata before an
@@ -114,6 +134,7 @@ type NotificationHint struct {
 	AmountMinor     int64
 	Currency        string
 	Status          string
+	StatusVersion   uint64
 }
 
 // NotificationChannel is optional. Each provider authenticates its own
@@ -123,10 +144,13 @@ type NotificationChannel interface {
 }
 
 type ChannelInfo struct {
-	Currency      string
-	Currencies    []string // supported invoice currencies for a hosted cashier
-	LoginRequired bool
-	TestMode      bool
+	Currency   string
+	Currencies []string // supported invoice currencies for a hosted cashier
+	// ValidateCurrencyAtCheckout delegates invoice currency acceptance to the
+	// provider's create API, independently of its internal cashier methods.
+	ValidateCurrencyAtCheckout bool
+	LoginRequired              bool
+	TestMode                   bool
 }
 
 type OrderSource interface {

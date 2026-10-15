@@ -10,46 +10,37 @@ import (
 	"github.com/zerodenet/zboard-pay-plugins/payment"
 )
 
-func TestAmbiguousCreateRestoresPinnedPrecisionAndRejectsResponseMismatch(t *testing.T) {
-	var directoryCalls, creates atomic.Int32
-	var directoryDecimals, responseDecimals atomic.Int32
-	directoryDecimals.Store(8)
-	responseDecimals.Store(8)
-	var responseAmount atomic.Int64
-	responseAmount.Store(1050000000)
-	var missingPrecision atomic.Bool
+func TestDecimalRetryRestoresWireContractWithoutProviderPrecision(t *testing.T) {
+	var creates, directoryCalls atomic.Int32
+	var response atomic.Value
+	response.Store("10.50000000")
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/token":
-			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "token", "expires_in": 300})
+			json.NewEncoder(w).Encode(map[string]any{"access_token": "token", "expires_in": 300})
 		case "/openapi/v1/merchant-payment-channels":
 			directoryCalls.Add(1)
-			_ = json.NewEncoder(w).Encode(map[string]any{"items": []MerchantChannel{{PaymentNo: "test", Currency: "TDC", CurrencyDecimals: intPointer(int(directoryDecimals.Load()))}}})
+			http.NotFound(w, r)
 		case "/openapi/v1/merchant-payments":
-			var request map[string]json.RawMessage
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
-			if string(request["amount_minor"]) != "1050000000" || string(request["idempotency_key"]) != `"same-key"` {
-				t.Errorf("retry changed provider parameters: %s", request)
+			if string(body["amount"]) != `"10.50"` || body["amount_minor"] != nil || body["payment_no"] != nil || string(body["idempotency_key"]) != `"same-key"` {
+				t.Errorf("unexpected retry parameters: %s", body)
 			}
 			if creates.Add(1) == 1 {
-				// Provider may already have created the order; no usable response.
-				w.WriteHeader(http.StatusServiceUnavailable)
+				w.WriteHeader(503)
 				return
 			}
-			view := merchantPayment{OrderNo: "mp", ExternalRef: "zb", PaymentNo: "test", Currency: "TDC", AmountMinor: responseAmount.Load(), CurrencyDecimals: intPointer(int(responseDecimals.Load())), Status: "pending", CheckoutURL: "https://checkout.example.test/1"}
-			if missingPrecision.Load() {
-				view.CurrencyDecimals = nil
-			}
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(view)
+			w.WriteHeader(201)
+			json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp", ExternalRef: "zb", Currency: "TDC", Amount: response.Load().(string), Status: "pending", CheckoutURL: "https://cashier.example.test/mp"})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
-	raw, _ := json.Marshal(Settings{Currencies: map[string]int{"USD": 2, "CNY": 2, "TDC": 8, "JPY": 0}, APIURL: server.URL, ClientID: "client", ClientSecret: "secret", PaymentNo: "test"})
+	raw, _ := json.Marshal(Settings{APIURL: server.URL, ClientID: "client", ClientSecret: "secret"})
 	active, err := NewFromSettings("tdcloud", raw, server.Client())
 	if err != nil {
 		t.Fatal(err)
@@ -62,42 +53,62 @@ func TestAmbiguousCreateRestoresPinnedPrecisionAndRejectsResponseMismatch(t *tes
 	if _, err := prepared.CreateCheckout(t.Context(), request); err == nil {
 		t.Fatal("ambiguous failure accepted")
 	}
-	directoryDecimals.Store(2)
 	restored, err := NewFromSnapshot("tdcloud", snapshot, server.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := restored.CreateCheckout(t.Context(), request); err != nil || directoryCalls.Load() != 0 {
-		t.Fatalf("retry must use saved units without discovery: %v directory=%d", err, directoryCalls.Load())
+		t.Fatalf("retry queried provider precision: %v", err)
 	}
-	for _, bad := range []string{"amount", "precision", "missing precision"} {
-		switch bad {
-		case "amount":
-			responseAmount.Add(1)
-		case "precision":
-			responseDecimals.Store(2)
-		case "missing precision":
-			missingPrecision.Store(true)
-		}
+	for _, bad := range []string{"10.51", "10.50000001", "1.05", "", "1e1", "-10.50", "10.50 "} {
+		response.Store(bad)
 		if _, err := restored.CreateCheckout(t.Context(), request); err == nil {
-			t.Fatalf("accepted checkout response with wrong %s", bad)
+			t.Fatalf("accepted response amount %q", bad)
 		}
-		responseAmount.Store(1050000000)
-		responseDecimals.Store(8)
 	}
 	if _, err := NormalizeSettings(snapshot, nil); err == nil {
-		t.Fatal("user config accepted plugin-managed amount metadata")
+		t.Fatal("merchant injected private wire metadata")
 	}
 }
 
-func TestLegacyInvoiceMetadataRejectsInvalidPrecisionIncludingZero(t *testing.T) {
-	for _, units := range []string{`{"JPY":-1}`, `{"JPY":9}`, `{"JPY":0.5}`, `{"jpy":0}`} {
-		raw := []byte(`{"api_url":"https://cloud.example.test","client_id":"client","client_secret":"secret","currencies":` + units + `}`)
-		if _, err := NormalizeSettings(raw, nil); err == nil {
-			t.Fatalf("invalid precision accepted: %s", units)
-		}
-	}
-	if _, err := NormalizeSettings([]byte(`{"api_url":"https://cloud.example.test","client_id":"client","client_secret":"secret","currencies":{"JPY":0}}`), nil); err != nil {
-		t.Fatalf("explicit zero precision rejected: %v", err)
+func TestHistoricalIntegerRetriesKeepOriginalUnitsAndMethod(t *testing.T) {
+	for _, versioned := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unversioned", true: "v1"}[versioned], func(t *testing.T) {
+			expected, decimals := int64(1050), 2
+			if versioned {
+				expected, decimals = 1050000000, 8
+			}
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/oauth/token" {
+					json.NewEncoder(w).Encode(map[string]any{"access_token": "token", "expires_in": 300})
+					return
+				}
+				if r.URL.Path != "/openapi/v1/merchant-payments" {
+					t.Error("legacy retry performed discovery")
+					http.NotFound(w, r)
+					return
+				}
+				var body map[string]json.RawMessage
+				json.NewDecoder(r.Body).Decode(&body)
+				if string(body["amount_minor"]) != map[bool]string{false: "1050", true: "1050000000"}[versioned] || body["amount"] != nil || string(body["payment_no"]) != `"original-method"` || body["notify_enabled"] != nil {
+					t.Errorf("legacy wire changed: %s", body)
+				}
+				w.WriteHeader(201)
+				json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp", ExternalRef: "zb", PaymentNo: "original-method", Currency: "TDC", AmountMinor: expected, CurrencyDecimals: intPointer(decimals), Status: "pending"})
+			}))
+			defer server.Close()
+			settings := Settings{APIURL: server.URL, ClientID: "client", ClientSecret: "secret", PaymentNo: "original-method"}
+			if versioned {
+				settings.AmountMetadata = &AmountMetadata{Version: 1, Currency: "TDC", Decimals: 8}
+			}
+			raw, _ := json.Marshal(settings)
+			restored, err := NewFromSnapshot("tdcloud", raw, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := restored.CreateCheckout(t.Context(), payment.CheckoutRequest{Reference: "zb", IdempotencyKey: "legacy-key", AmountMinor: 1050, Currency: "TDC"}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

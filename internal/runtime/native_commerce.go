@@ -51,6 +51,10 @@ func (c nativeCommerce) Record(ctx context.Context, principal string, fact payme
 		result, err := c.host.RecordPayment(ctx, pluginv1.PaymentFactRequest{PrincipalID: principal, OrderID: uint(fact.OrderID),
 			ProviderEventID: fact.ProviderEventID, ProviderTradeNo: fact.ProviderTradeNo, Status: fact.Status,
 			AmountMinor: fact.AmountMinor, Currency: fact.Currency, OccurredAt: fact.OccurredAt})
+		var hostErr *pluginv1.HostCallError
+		if errors.As(err, &hostErr) && hostErr.Code == "conflict" {
+			return payment.ErrFactNeedsReview
+		}
 		if err == nil && (uint64(result.OrderID) != fact.OrderID || result.Status != "paid") {
 			return payment.ErrConflict
 		}
@@ -71,10 +75,10 @@ func retryNative(ctx context.Context, call func() error) error {
 		err := call()
 		var hostErr *pluginv1.HostCallError
 		temporary := errors.As(err, &hostErr) && (hostErr.Code == "temporary_unavailable" || hostErr.Code == "deadline_exceeded")
-		if !temporary || attempt == 2 {
+		if !temporary || attempt == 5 {
 			return err
 		}
-		timer := time.NewTimer(time.Duration(attempt+1) * 50 * time.Millisecond)
+		timer := time.NewTimer(time.Duration(1<<attempt) * 50 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()

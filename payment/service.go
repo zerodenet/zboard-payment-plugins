@@ -62,8 +62,65 @@ func (s Service) Start(ctx context.Context, accountID string, orderID uint64, ch
 	if attempt.OrderTradeNo != order.TradeNo || attempt.AmountMinor != order.AmountMinor || attempt.Currency != strings.ToUpper(order.Currency) {
 		return Attempt{}, ErrConflict
 	}
+	attempt = CloneAttempt(attempt)
+	for _, historical := range attempt.History {
+		if historical.VerifiedFact == nil || historical.FactState == "recorded" {
+			continue
+		}
+		if historical.FactState == "review" && attempt.SettledProvider == "" {
+			return attempt, ErrFactNeedsReview
+		}
+		if historical.FactState == "pending" {
+			attempt, err = s.deliverFact(ctx, accountID, orderID, historical.ChannelID, historical.ProviderOrderID)
+			if err != nil {
+				return attempt, err
+			}
+		}
+	}
+	if attempt.VerifiedFact != nil && attempt.FactState == "pending" {
+		attempt, err = s.deliverFact(ctx, accountID, orderID, attempt.ChannelID, attempt.ProviderOrderID)
+		if err != nil {
+			return attempt, err
+		}
+	}
 	if returnURL != "" && returnURL != attempt.ReturnURL && attempt.State != "failed" {
 		return Attempt{}, ErrConflict
+	}
+	if attempt.State == "paid" || attempt.SettledProvider != "" {
+		if attempt.FactState == "review" && attempt.SettledProvider == "" {
+			return attempt, ErrFactNeedsReview
+		}
+		attempt.RedirectURL, attempt.State = "", "paid"
+		return attempt, nil
+	}
+	if attempt.State == "failed" && attempt.ProviderOrderID != "" {
+		attempt, err = s.Reconcile(ctx, accountID, orderID)
+		if err != nil {
+			return attempt, err
+		}
+		if attempt.State == "paid" || attempt.SettledProvider != "" {
+			attempt.RedirectURL, attempt.State = "", "paid"
+			return attempt, nil
+		}
+	}
+	// A saved redirect is usable only within its provider-issued deadline.
+	// Expiry alone cannot release an order: a late payment may be in flight.
+	if attempt.State == "pending" && attempt.ProviderOrderID != "" &&
+		(attempt.RedirectURL == "" || !attempt.ExpiresAt.After(time.Now())) {
+		attempt, err = s.Reconcile(ctx, accountID, orderID)
+		if err != nil {
+			return attempt, err
+		}
+		switch attempt.State {
+		case "paid":
+			attempt.RedirectURL = "" // return to the host receipt, never the old cashier
+			return attempt, nil
+		case "failed":
+			// The authenticated lookup confirmed terminal failure. Reuse the
+			// business order below with a new, persisted attempt/key.
+		default:
+			return attempt, ErrCheckoutExpiryPending
+		}
 	}
 	if attempt.State == "failed" {
 		if s.PrepareChannel != nil {
@@ -75,10 +132,14 @@ func (s Service) Start(ctx context.Context, accountID string, orderID uint64, ch
 		if returnURL != "" {
 			attempt.ReturnURL = returnURL
 		}
-		attempt.PreviousOrders = append(attempt.PreviousOrders, attempt.ProviderOrderID)
+		if attempt.ProviderOrderID != "" {
+			attempt.History = append(attempt.History, archived(attempt))
+			attempt.PreviousOrders = append(attempt.PreviousOrders, attempt.ProviderOrderID)
+		}
 		attempt.ChannelID, attempt.ProviderOrderID, attempt.RedirectURL = channelID, "", ""
 		attempt.ChannelSnapshot = append([]byte(nil), s.ChannelSnapshot...)
 		attempt.ExpiresAt, attempt.State, attempt.AttemptNumber = time.Time{}, "creating", attempt.AttemptNumber+1
+		attempt.ProviderVersion, attempt.VerifiedFact, attempt.FactState, attempt.ReviewReason, attempt.NextCheckAt = 0, nil, "", "", time.Time{}
 		attempt, err = s.Attempts.Put(ctx, attempt)
 		if err != nil {
 			return Attempt{}, err
@@ -119,11 +180,16 @@ func (s Service) Start(ctx context.Context, accountID string, orderID uint64, ch
 	if err != nil {
 		return Attempt{}, fmt.Errorf("create checkout: %w", err)
 	}
-	if checkout.ProviderOrderID == "" || (checkout.Status != "" && checkout.Status != "pending" && checkout.Status != "review" && checkout.Status != "paid") ||
+	if checkout.ProviderOrderID == "" || (checkout.Status != "" && checkout.Status != "pending" && checkout.Status != "review" && checkout.Status != "paid" && checkout.Status != "failed") ||
 		((checkout.Status == "" || checkout.Status == "pending") && (!validHTTPSURL(checkout.RedirectURL) || !checkout.ExpiresAt.After(time.Now()))) {
 		return Attempt{}, errors.New("channel returned an invalid checkout")
 	}
 	attempt.ProviderOrderID, attempt.State = checkout.ProviderOrderID, "pending"
+	attempt.ProviderVersion = checkout.StatusVersion
+	if checkout.Status == "failed" {
+		attempt.State = "failed"
+	}
+	attempt.ExpiresAt = checkout.ExpiresAt
 	if checkout.Status == "" || checkout.Status == "pending" {
 		attempt.RedirectURL, attempt.ExpiresAt = checkout.RedirectURL, checkout.ExpiresAt
 	}
@@ -134,80 +200,10 @@ func (s Service) Start(ctx context.Context, accountID string, orderID uint64, ch
 			return current, nil
 		}
 	}
+	if err == nil && checkout.Status == "failed" {
+		return attempt, ErrCheckoutFailed
+	}
 	return attempt, err
-}
-
-// Reconcile handles both the buyer's confirmation button and the returned
-// checkout window. It only commits a verified provider fact. A successful
-// ZBoard record precedes the local paid marker, so a crash can safely replay
-// the same event without fulfilling the business order twice.
-func (s Service) Reconcile(ctx context.Context, accountID string, orderID uint64) (Attempt, error) {
-	attempt, err := s.Attempts.Get(ctx, accountID, orderID)
-	if err != nil {
-		return Attempt{}, err
-	}
-	if attempt.State == "paid" || attempt.State == "failed" || attempt.State == "review" {
-		return attempt, nil
-	}
-	if attempt.ProviderOrderID == "" {
-		return attempt, ErrPending
-	}
-	channel := s.Channels[attempt.ChannelID]
-	if s.ResolveChannel != nil && len(attempt.ChannelSnapshot) > 0 {
-		channel, err = s.ResolveChannel(attempt)
-		if err != nil {
-			return attempt, err
-		}
-	}
-	if channel == nil || channel.ID() != attempt.ChannelID {
-		return attempt, ErrConflict
-	}
-	result, err := channel.Lookup(ctx, attempt.ProviderOrderID)
-	if err != nil {
-		return attempt, err
-	}
-	if result.ProviderOrderID != attempt.ProviderOrderID || result.Reference != attempt.OrderTradeNo ||
-		result.AmountMinor != attempt.AmountMinor || strings.ToUpper(result.Currency) != attempt.Currency {
-		return attempt, ErrConflict
-	}
-	switch result.Status {
-	case "pending", "unknown":
-		return attempt, nil
-	case "failed":
-		// A failed provider attempt does not fail the ZBoard business order; a
-		// buyer may choose another channel after this terminal attempt.
-		attempt.State = "failed"
-		return s.Attempts.Put(ctx, attempt)
-	case "reversed":
-		// A refund or chargeback needs a separate business reversal decision.
-		// Keep this attempt out of both settlement and new checkout creation.
-		attempt.State = "review"
-		return s.Attempts.Put(ctx, attempt)
-	case "paid":
-		if result.EventID == "" || result.ProviderTradeNo == "" || result.OccurredAt.IsZero() {
-			return attempt, ErrConflict
-		}
-		fact := PaymentFact{OrderID: orderID, ProviderEventID: attempt.ChannelID + ":" + result.EventID,
-			ProviderTradeNo: result.ProviderTradeNo, Status: "paid", AmountMinor: attempt.AmountMinor,
-			Currency: attempt.Currency, OccurredAt: result.OccurredAt}
-		if err := s.Facts.Record(ctx, accountID, fact); err != nil {
-			return attempt, err
-		}
-		attempt.State = "paid"
-		paid, err := s.Attempts.Put(ctx, attempt)
-		if errors.Is(err, ErrConflict) {
-			// The original page and the returned checkout window may confirm at
-			// the same time. ZBoard records the identical provider event once;
-			// acknowledge a concurrent local paid marker as the same result.
-			current, getErr := s.Attempts.Get(ctx, accountID, orderID)
-			if getErr == nil && current.State == "paid" && current.ProviderOrderID == attempt.ProviderOrderID && current.ChannelID == attempt.ChannelID {
-				return current, nil
-			}
-		}
-		return paid, err
-	default:
-		return attempt, ErrConflict
-	}
 }
 
 func idempotencyKey(a Attempt) string {

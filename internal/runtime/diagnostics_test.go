@@ -47,8 +47,8 @@ func TestConnectionDiagnosticsSeparateMerchantAccessFromPaymentReadiness(t *test
 				t.Fatal("loading untested configuration must remain fast and report unknown access")
 			}
 			health, err := s.TestConfig(t.Context(), &pluginv1.ConfigRequest{ConfigJson: raw})
-			if err != nil || health.Healthy || requests.Load() == 0 || creates.Load() != 0 {
-				t.Fatalf("probe must verify access without creating orders or claiming payment readiness: %+v %v", health, err)
+			if err != nil || health.Healthy != authorized || requests.Load() == 0 || creates.Load() != 0 {
+				t.Fatalf("decimal contract readiness must depend on merchant access without creating orders: %+v %v", health, err)
 			}
 			view, err = s.DescribeConfig(t.Context(), &pluginv1.ConfigRequest{ConfigJson: raw})
 			if err != nil {
@@ -58,11 +58,11 @@ func TestConnectionDiagnosticsSeparateMerchantAccessFromPaymentReadiness(t *test
 				t.Fatal(err)
 			}
 			report := projected.Diagnostics[0]
-			code := "connection_failed"
+			code := "oauth_failed"
 			if authorized {
-				code = "provider_metadata_missing"
+				code = ""
 			}
-			if report.Connected == nil || *report.Connected != authorized || report.PaymentReady || report.Code != code {
+			if report.Connected == nil || *report.Connected != authorized || report.PaymentReady != authorized || report.Code != code {
 				t.Fatalf("wrong diagnostic: %+v", report)
 			}
 			if strings.Contains(string(view.NormalizedJson), "private-credential") || strings.Contains(string(view.NormalizedJson), "private-token") {

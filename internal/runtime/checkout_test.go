@@ -35,7 +35,7 @@ func (s *checkoutAttempts) Get(_ context.Context, account string, id uint64) (pa
 	if s.attempt.Revision == 0 || s.attempt.AccountID != account || s.attempt.OrderID != id {
 		return payment.Attempt{}, payment.ErrNotFound
 	}
-	return s.attempt, nil
+	return payment.CloneAttempt(s.attempt), nil
 }
 
 func (s *checkoutAttempts) Put(_ context.Context, next payment.Attempt) (payment.Attempt, error) {
@@ -45,17 +45,22 @@ func (s *checkoutAttempts) Put(_ context.Context, next payment.Attempt) (payment
 		return payment.Attempt{}, payment.ErrConflict
 	}
 	next.Revision++
-	s.attempt = next
+	s.attempt = payment.CloneAttempt(next)
 	return next, nil
 }
 
 func (s *checkoutAttempts) FindByProviderOrder(_ context.Context, providerType, providerOrderID string) (payment.Attempt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if providerType != "tdcloud" || providerOrderID == "" || s.attempt.ProviderOrderID != providerOrderID {
+	if providerType != "tdcloud" || providerOrderID == "" {
 		return payment.Attempt{}, payment.ErrNotFound
 	}
-	return s.attempt, nil
+	for _, a := range append(append([]payment.Attempt(nil), s.attempt.History...), s.attempt) {
+		if a.ProviderOrderID == providerOrderID {
+			return payment.CloneAttempt(a), nil
+		}
+	}
+	return payment.Attempt{}, payment.ErrNotFound
 }
 
 type checkoutFacts struct {
@@ -106,7 +111,7 @@ func TestConfiguredCheckoutUsesTDCloudAndConfirmsOnce(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "return_url": request.ReturnURL,
-				"payment_no": "stripe-usd", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "pending",
+				"payment_no": "stripe-usd", "amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "pending",
 				"checkout_url": "https://pay.example/mp-42", "expires_at": time.Now().Add(time.Hour)})
 		case "/openapi/v1/merchant-payments/mp-42":
 			status := "pending"
@@ -114,7 +119,7 @@ func TestConfiguredCheckoutUsesTDCloudAndConfirmsOnce(t *testing.T) {
 				status = "paid"
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "stripe-usd",
-				"amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": status, "event_id": "event-42", "provider_trade_no": "trade-42", "occurred_at": time.Now().UTC()})
+				"amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": status, "event_id": "event-42", "provider_trade_no": "trade-42", "occurred_at": time.Now().UTC()})
 		default:
 			http.NotFound(w, r)
 		}
@@ -190,7 +195,8 @@ func TestAmbiguousCreateRetriesWithPinnedProviderAfterConfigRemoval(t *testing.T
 			directoryCalls.Add(1)
 		case "/openapi/v1/merchant-payments":
 			var input struct {
-				AmountMinor   int64  `json:"amount_minor"`
+				Amount        string `json:"amount"`
+				AmountMinor   *int64 `json:"amount_minor"`
 				Key           string `json:"idempotency_key"`
 				ReturnURL     string `json:"return_url"`
 				NotifyEnabled bool   `json:"notify_enabled"`
@@ -198,8 +204,8 @@ func TestAmbiguousCreateRetriesWithPinnedProviderAfterConfigRemoval(t *testing.T
 				NotifySecret  string `json:"notify_secret"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&input)
-			if input.AmountMinor != 1050000000 {
-				t.Errorf("changed amount on retry: %d", input.AmountMinor)
+			if input.Amount != "10.50" || input.AmountMinor != nil {
+				t.Errorf("changed amount on retry: %q", input.Amount)
 			}
 			if input.ReturnURL != "https://board.example/orders/42" {
 				t.Errorf("changed return URL: %q", input.ReturnURL)
@@ -217,7 +223,7 @@ func TestAmbiguousCreateRetriesWithPinnedProviderAfterConfigRemoval(t *testing.T
 			}
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "return_url": input.ReturnURL,
-				"payment_no": "stripe-usd", "amount_minor": 1050000000, "currency": "USD", "currency_decimals": 8, "status": "pending",
+				"payment_no": "stripe-usd", "amount": "10.50000000", "amount_minor": 1050000000, "currency": "USD", "currency_decimals": 8, "status": "pending",
 				"checkout_url": "https://pay.example/mp-42", "expires_at": time.Now().Add(time.Hour)})
 		default:
 			http.NotFound(w, r)

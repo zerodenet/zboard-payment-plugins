@@ -69,7 +69,7 @@ func (s *Server) HandleHTTP(ctx context.Context, request *pluginv1.HTTPRequest) 
 	if err != nil {
 		return publicJSON(http.StatusServiceUnavailable, 30), nil
 	}
-	_, err = checkout.ConfirmNotification(ctx, attempt.AccountID, attempt.OrderID, request.Body, headers, time.Now())
+	_, err = checkout.confirmAttemptNotification(ctx, attempt, request.Body, headers, time.Now())
 	switch {
 	case err == nil:
 		return publicJSON(http.StatusOK, 0), nil

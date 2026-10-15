@@ -97,16 +97,22 @@ func hostedResponse(data any) (*pluginv1.PageActionResponse, error) {
 func hostedError(err error) error {
 	code := actionErrorCode(err)
 	switch code {
+	case "checkout_expiry_pending":
+		return pluginv1.NewActionError(code, "支付窗口已超时，渠道仍在核对原收款结果；请稍后重试", true)
+	case "payment_review_required":
+		return pluginv1.NewActionError(code, "付款已核实，需要管理员核对收款；请勿重复支付", false)
 	case "amount_unrepresentable":
-		return status.Error(codes.InvalidArgument, "订单金额不能按所选渠道精度收款，请选择其他方式")
+		return pluginv1.NewActionError(code, "所选支付渠道不支持该订单金额，请选择其他方式", false)
 	case "permission_denied":
 		return status.Error(codes.PermissionDenied, "支付授权不可用，请重新进入订单页")
 	case "invalid_argument":
 		return status.Error(codes.InvalidArgument, "订单支付请求无效")
-	case "conflict", "checkout_failed":
-		return status.Error(codes.FailedPrecondition, "支付状态冲突，请核对订单")
+	case "conflict":
+		return pluginv1.NewActionError(code, "支付状态冲突，请核对订单", false)
+	case "checkout_failed":
+		return pluginv1.NewActionError(code, "本次支付未能创建，请使用同一订单重试", true)
 	case "not_found":
-		return status.Error(codes.NotFound, "该订单尚无可核对的支付尝试")
+		return pluginv1.NewActionError(code, "该订单尚无可核对的支付尝试", true)
 	default:
 		return status.Error(codes.Unavailable, "支付暂时不可用，请使用同一订单重试")
 	}

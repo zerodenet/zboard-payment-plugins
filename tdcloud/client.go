@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,11 +26,11 @@ type Client struct {
 	notifySecret    string
 	notifyMode      string
 	notifyEnabled   *bool
+	expiresIn       *int64
 	http            *http.Client
 	auth            *merchantToken
 	amount          *AmountMetadata
 	legacyAmount    bool
-	currencies      map[string]int
 }
 
 type merchantToken struct {
@@ -45,10 +44,12 @@ type merchantPayment struct {
 	ExternalRef      string    `json:"external_reference"`
 	ReturnURL        string    `json:"return_url"`
 	PaymentNo        string    `json:"payment_no"`
+	Amount           string    `json:"amount"`
 	AmountMinor      int64     `json:"amount_minor"`
 	Currency         string    `json:"currency"`
 	CurrencyDecimals *int      `json:"currency_decimals"`
 	Status           string    `json:"status"`
+	StatusVersion    uint64    `json:"status_version"`
 	CheckoutURL      string    `json:"checkout_url"`
 	ExpiresAt        time.Time `json:"expires_at"`
 	ProviderTradeNo  string    `json:"provider_trade_no"`
@@ -70,28 +71,36 @@ type MerchantChannel struct {
 type APIError struct {
 	StatusCode int
 	Code       string
+	OAuth      bool
 }
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("TDCloud API returned HTTP %d (%s)", e.StatusCode, e.Code)
 }
 
-func New(id, baseURL, clientID, secret string, currencies map[string]int, httpClient *http.Client) (*Client, error) {
+// These formal rejection codes guarantee no new provider order was created,
+// so the shared checkout may release the attempt for another payment option.
+func (e *APIError) Is(target error) bool {
+	if e.OAuth {
+		return false
+	}
+	if e.StatusCode == http.StatusBadRequest && (e.Code == "invalid_amount" || e.Code == "invalid_amount_precision") {
+		return target == payment.ErrAmountPrecision
+	}
+	return target == payment.ErrCheckoutFailed && e.StatusCode == http.StatusUnprocessableEntity && e.Code == "currency_unavailable"
+}
+
+func New(id, baseURL, clientID, secret string, httpClient *http.Client) (*Client, error) {
 	u, err := url.Parse(strings.TrimRight(baseURL, "/"))
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" ||
 		id == "" || clientID == "" || secret == "" {
 		return nil, errors.New("invalid TDCloud channel configuration")
 	}
-	if len(currencies) > 0 {
-		if err := validateCurrencies(currencies); err != nil {
-			return nil, err
-		}
-	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	disabled := false
-	return &Client{id: id, baseURL: strings.TrimRight(baseURL, "/"), clientID: clientID, secret: secret, currencies: cloneCurrencies(currencies), notifyEnabled: &disabled, http: httpClient, auth: &merchantToken{}}, nil
+	return &Client{id: id, baseURL: strings.TrimRight(baseURL, "/"), clientID: clientID, secret: secret, notifyEnabled: &disabled, http: httpClient, auth: &merchantToken{}}, nil
 }
 
 func (c *Client) ID() string { return c.id }
@@ -112,36 +121,17 @@ func (c *Client) cashierDirectorySize(ctx context.Context) (int, error) {
 }
 
 // Describe checks merchant access without choosing or projecting cashier methods.
-// Invoice units require authoritative metadata, never merchant-entered overrides.
+// TDCloud validates invoice currency and decimal amounts at creation. Directory
+// method currencies are never used to constrain the outer business order.
 func (c *Client) Describe(ctx context.Context) (payment.ChannelInfo, error) {
-	if len(c.currencies) == 0 {
-		return payment.ChannelInfo{}, ErrCurrencyMetadataUnavailable
-	}
 	count, err := c.cashierDirectorySize(ctx)
 	if err != nil {
 		return payment.ChannelInfo{}, err
 	}
 	if count == 0 {
-		return payment.ChannelInfo{}, errors.New("TDCloud cashier has no available payment methods")
+		return payment.ChannelInfo{}, errCashierEmpty
 	}
-	codes := make([]string, 0, len(c.currencies))
-	for code := range c.currencies {
-		codes = append(codes, code)
-	}
-	sort.Strings(codes)
-	info := payment.ChannelInfo{Currencies: codes}
-	if len(codes) == 1 {
-		info.Currency = codes[0]
-	}
-	return info, nil
-}
-
-func cloneCurrencies(source map[string]int) map[string]int {
-	copy := make(map[string]int, len(source))
-	for code, decimals := range source {
-		copy[code] = decimals
-	}
-	return copy
+	return payment.ChannelInfo{ValidateCurrencyAtCheckout: true}, nil
 }
 
 var _ payment.Channel = (*Client)(nil)
@@ -165,7 +155,11 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("TDCloud OAuth returned HTTP %d", response.StatusCode)
+		var remote struct {
+			Code string `json:"error"`
+		}
+		_ = decode(response.Body, &remote)
+		return "", &APIError{StatusCode: response.StatusCode, Code: remote.Code, OAuth: true}
 	}
 	var token struct {
 		AccessToken string `json:"access_token"`
@@ -217,56 +211,43 @@ func decode(reader io.Reader, out any) error {
 }
 
 func (c *Client) CreateCheckout(ctx context.Context, request payment.CheckoutRequest) (payment.Checkout, error) {
-	if request.Reference == "" || request.IdempotencyKey == "" || request.AmountMinor <= 0 || request.AmountMinor > 9007199254740991 || len(request.Currency) != 3 {
+	if request.Reference == "" || request.Reference != strings.TrimSpace(request.Reference) || len(request.Reference) > 191 ||
+		request.IdempotencyKey == "" || request.IdempotencyKey != strings.TrimSpace(request.IdempotencyKey) || len(request.IdempotencyKey) > 128 ||
+		request.AmountMinor <= 0 || !validCurrency(request.Currency) {
 		return payment.Checkout{}, errors.New("invalid TDCloud checkout request")
 	}
 	var view merchantPayment
-	metadata, err := c.resolveAmount(ctx, request.Currency)
+	amount, err := formatHostAmount(request.AmountMinor)
 	if err != nil {
 		return payment.Checkout{}, err
 	}
-	if c.legacyAmount && metadata.Decimals != hostDecimals {
-		return payment.Checkout{}, payment.ErrAmountPrecision
+	if c.amount != nil && c.amount.Currency != request.Currency {
+		return payment.Checkout{}, payment.ErrConflict
 	}
-	providerAmount, err := toProviderMinor(request.AmountMinor, metadata.Decimals)
+	body, returnURL, err := c.createBody(request, amount)
 	if err != nil {
 		return payment.Checkout{}, err
-	}
-	body := map[string]any{
-		"external_reference": request.Reference, "idempotency_key": request.IdempotencyKey,
-		"description":  request.Description,
-		"amount_minor": providerAmount, "currency": request.Currency,
-	}
-	if c.legacyPaymentNo != "" {
-		body["payment_no"] = c.legacyPaymentNo
-	}
-	if request.ReturnURL != "" {
-		body["return_url"] = request.ReturnURL
-	}
-	if c.notifyEnabled != nil {
-		body["notify_enabled"] = *c.notifyEnabled
-	}
-	if c.notifyURL != "" && c.notifyMode != "merchant_default" {
-		body["notify_url"], body["notify_secret"] = c.notifyURL, c.notifySecret
 	}
 	err = c.request(ctx, http.MethodPost, "/openapi/v1/merchant-payments", body, http.StatusCreated, &view)
 	if err != nil {
 		return payment.Checkout{}, err
 	}
+	verifiedAmount, amountErr := c.resultAmount(view.Amount, view.AmountMinor, view.Currency, view.CurrencyDecimals)
 	if view.OrderNo == "" || view.ExternalRef != request.Reference || (c.legacyPaymentNo != "" && view.PaymentNo != c.legacyPaymentNo) ||
-		view.AmountMinor != providerAmount || view.CurrencyDecimals == nil || *view.CurrencyDecimals != metadata.Decimals ||
-		!strings.EqualFold(view.Currency, request.Currency) || view.ReturnURL != request.ReturnURL {
+		amountErr != nil || verifiedAmount != request.AmountMinor ||
+		!strings.EqualFold(view.Currency, request.Currency) || view.ReturnURL != returnURL {
 		return payment.Checkout{}, errors.New("TDCloud checkout does not match requested order")
 	}
-	if view.Status == "expired" {
-		return payment.Checkout{}, payment.ErrCheckoutFailed
-	}
-	if view.Status != "pending" && view.Status != "review" && view.Status != "paid" {
+	if view.Status != "pending" && view.Status != "review" && view.Status != "paid" && view.Status != "expired" {
 		return payment.Checkout{}, fmt.Errorf("TDCloud checkout cannot be started in state %q", view.Status)
 	}
 	// review and paid may be returned on an idempotent retry. Preserve the
 	// provider order so the service can reconcile it by server-side lookup.
-	return payment.Checkout{ProviderOrderID: view.OrderNo, RedirectURL: view.CheckoutURL, ExpiresAt: view.ExpiresAt, Status: view.Status}, nil
+	state := view.Status
+	if state == "expired" {
+		state = "failed"
+	}
+	return payment.Checkout{ProviderOrderID: view.OrderNo, RedirectURL: view.CheckoutURL, ExpiresAt: view.ExpiresAt, Status: state, StatusVersion: view.StatusVersion}, nil
 }
 
 func (c *Client) Lookup(ctx context.Context, orderNo string) (payment.PaymentResult, error) {
@@ -281,7 +262,7 @@ func (c *Client) Lookup(ctx context.Context, orderNo string) (payment.PaymentRes
 	if view.OrderNo != orderNo || (c.legacyPaymentNo != "" && view.PaymentNo != c.legacyPaymentNo) || view.ExternalRef == "" {
 		return payment.PaymentResult{}, errors.New("TDCloud payment identity mismatch")
 	}
-	amount, err := c.normalizeAmount(view.AmountMinor, view.Currency, view.CurrencyDecimals)
+	amount, err := c.resultAmount(view.Amount, view.AmountMinor, view.Currency, view.CurrencyDecimals)
 	if err != nil {
 		return payment.PaymentResult{}, err
 	}
@@ -299,6 +280,6 @@ func (c *Client) Lookup(ctx context.Context, orderNo string) (payment.PaymentRes
 		return payment.PaymentResult{}, fmt.Errorf("unknown TDCloud payment state %q", view.Status)
 	}
 	return payment.PaymentResult{ProviderOrderID: view.OrderNo, Reference: view.ExternalRef, ProviderTradeNo: view.ProviderTradeNo,
-		EventID: view.EventID, Status: state, AmountMinor: amount,
+		EventID: view.EventID, Status: state, StatusVersion: view.StatusVersion, ProviderState: view.Status, AmountMinor: amount,
 		Currency: view.Currency, OccurredAt: view.OccurredAt}, nil
 }

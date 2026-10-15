@@ -91,6 +91,20 @@ func (c *CheckoutCoordinator) Start(ctx context.Context, accountID string, order
 		if lookupErr != nil {
 			return CheckoutView{}, fmt.Errorf("restore payment channel %s: %w", channelID, lookupErr)
 		}
+		// Historical credentials can check the old attempt, but renewal must
+		// use a currently enabled channel and a new configuration snapshot.
+		prepare = func(ctx context.Context, _ payment.Channel, order payment.Order) (payment.Channel, []byte, error) {
+			for _, item := range c.server.current().Channels {
+				if item.ID == channelID && item.Enabled {
+					active, err := c.server.channelFor(item)
+					if err != nil {
+						return nil, nil, err
+					}
+					return c.server.prepareSnapshot(ctx, item, active, order.Currency)
+				}
+			}
+			return nil, nil, payment.ErrConflict
+		}
 	} else {
 		var selected *channelConfig
 		for _, item := range c.server.current().Channels {
@@ -145,5 +159,15 @@ func (c *CheckoutCoordinator) Confirm(ctx context.Context, accountID string, ord
 }
 
 func checkoutView(attempt payment.Attempt) CheckoutView {
+	if attempt.SettledProvider != "" {
+		return CheckoutView{OrderID: attempt.OrderID, State: "paid"}
+	}
+	if attempt.VerifiedFact != nil && attempt.FactState != "recorded" {
+		state := "pending"
+		if attempt.FactState == "review" {
+			state = "review"
+		}
+		return CheckoutView{OrderID: attempt.OrderID, State: state}
+	}
 	return CheckoutView{OrderID: attempt.OrderID, State: attempt.State, RedirectURL: attempt.RedirectURL}
 }

@@ -46,11 +46,16 @@ func decodeAction(raw []byte, out any) bool {
 // HandlePageAction uses only the actor supplied by the authenticated host RPC.
 // No browser payload may select an account, amount, fact, or return URL.
 func (s *Server) HandlePageAction(ctx context.Context, r *pluginv1.PageActionRequest) (*pluginv1.PageActionResponse, error) {
+	if r != nil && r.Action == "payments.reviews" {
+		return s.reviewAction(ctx, r)
+	}
 	if r == nil || r.Surface != "account" || r.ActorId == "" ||
 		(r.PageId != "" && r.PageId != "payment-methods" && r.PageId != "order-payment") {
 		return actionResponse(nil, "permission_denied")
 	}
 	switch r.Action {
+	case "payments.inspect":
+		return s.inspectAction(ctx, r)
 	case "payments.prepare", "payments.reconcile":
 		return s.hostedAction(ctx, r)
 	case "payments.status":
@@ -169,6 +174,10 @@ func actionErrorCode(err error) string {
 		return "checkout_failed"
 	case errors.Is(err, payment.ErrAmountPrecision):
 		return "amount_unrepresentable"
+	case errors.Is(err, payment.ErrCheckoutExpiryPending):
+		return "checkout_expiry_pending"
+	case errors.Is(err, payment.ErrFactNeedsReview):
+		return "payment_review_required"
 	case errors.Is(err, payment.ErrPending):
 		return "pending"
 	default:

@@ -118,6 +118,13 @@ export async function mountConfigEntry(root, { bridge, providers = channelConfig
     for (const report of view.config?.diagnostics || []) {
       const reason = report.code === "provider_metadata_missing" ? "支付接入未完成：订单币种信息自动读取尚未接通。"
         : report.code === "connection_failed" ? "连接检测未通过，请检查渠道接口、商户授权或网络。"
+        : report.code === "oauth_scope_missing" ? "商户 OAuth 缺少收款授权，请在 TDCloud 为此客户端开放 merchant_payments.create 和 merchant_payments.read。"
+        : report.code === "oauth_client_rejected" ? "TDCloud 拒绝了客户端凭据，请核对 Client ID 和 Client Secret。"
+        : report.code === "oauth_client_ineligible" ? "此 OAuth 客户端不具备商户服务端收款资格，请核对 TDCloud 客户端类型和商户绑定。"
+        : report.code === "oauth_failed" ? "TDCloud OAuth 授权请求未通过，请检查客户端状态和服务可用性。"
+        : report.code === "cashier_empty" ? "TDCloud 未返回可用收银方式，请在 TDCloud 检查商户可收款渠道。"
+        : report.code === "provider_access_denied" ? "OAuth 已响应，但 TDCloud 收款接口拒绝访问，请核对商户绑定和收款授权。"
+        : report.code === "provider_unavailable" ? "TDCloud 收款接口当前不可用，请检查接口地址和服务状态。"
         : report.code === "configuration_invalid" ? "渠道配置未通过校验，请检查参数。"
         : report.code === "check_timeout" ? "渠道检测超时。"
         : report.code === "disabled" ? "渠道已停用。"
@@ -207,6 +214,7 @@ export async function mountConfigEntry(root, { bridge, providers = channelConfig
       show(view);
       const reports = view.config?.diagnostics || [];
       if (reports.some(report => report.code === "provider_metadata_missing")) message("渠道接入尚未完成，具体原因见检测结果。", true);
+      else if (reports.some(report => report.code && !["not_tested", "disabled"].includes(report.code))) message("渠道检测未通过，具体原因见检测结果。", true);
       else if (failure) message(errors[failure.code] || "渠道检测未通过，具体原因见检测结果。", true);
       else message("检测通过，可回到插件详情页启用插件。");
     } catch { message("无法读取检测结果，请刷新配置后重试。", true); }

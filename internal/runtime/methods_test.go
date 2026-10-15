@@ -43,8 +43,8 @@ func TestCheckoutPublishesOneCashierForMultipleInvoiceCurrencies(t *testing.T) {
 			t.Fatal("cashier internals leaked")
 		}
 	}
-	if methods, err := s.ListMethods(t.Context(), "EUR"); err != nil || len(methods) != 0 {
-		t.Fatalf("unconfigured invoice currency: %+v %v", methods, err)
+	if methods, err := s.ListMethods(t.Context(), "EUR"); err != nil || len(methods) != 1 {
+		t.Fatalf("invoice currency must be validated by TDCloud at checkout: %+v %v", methods, err)
 	}
 }
 
@@ -93,26 +93,9 @@ func TestCheckoutMethodsAreConcurrentCachedAndInvalidated(t *testing.T) {
 		t.Fatal(err)
 	}
 	methods, err = s.ListMethods(ctx, "USD")
-	if err == nil || len(methods) != 0 || directoryCalls.Load() != 2 {
-		t.Fatalf("new configuration reused stale/manual invoice metadata: %+v %v", methods, err)
-	}
-	useLegacyFixtureConfig(s, cfg)
-	methods, err = s.ListMethods(ctx, "USD")
 	if err != nil || len(methods) != 2 || directoryCalls.Load() != 4 {
 		t.Fatalf("invalidated methods: %+v %v; directory calls %d", methods, err, directoryCalls.Load())
 	}
-}
-
-// These injected legacy values isolate coordinator/cache behavior. Production
-// ApplyConfig removes manual invoice units, so these fixtures are not evidence
-// of authoritative metadata discovery or a closed merchant setup flow.
-func useLegacyFixtureConfig(s *Server, cfg config) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.config = cfg
-	s.configGeneration++
-	s.methodsCache = nil
-	s.methodsFlights = nil
 }
 
 func TestCheckoutMethodsKeepHealthyChannelWhenAnotherFails(t *testing.T) {

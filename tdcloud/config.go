@@ -23,7 +23,7 @@ type Settings struct {
 	ClientID       string          `json:"client_id"`
 	ClientSecret   string          `json:"client_secret"`
 	PaymentNo      string          `json:"payment_no,omitempty"` // historical snapshots only
-	Currencies     map[string]int  `json:"currencies,omitempty"` // compatibility with earlier private test settings
+	Currencies     map[string]int  `json:"currencies,omitempty"` // ignored legacy configuration; never used for new orders
 	NotifyURL      string          `json:"notify_url,omitempty"`
 	NotifySecret   string          `json:"notify_secret,omitempty"`
 	// Empty denotes legacy per-order overrides. New UI configuration inherits
@@ -32,6 +32,9 @@ type Settings struct {
 	// Nil is retained only in checkout snapshots created before notification
 	// support. New configuration always pins the choice for idempotent retries.
 	NotifyEnabled *bool `json:"notify_enabled,omitempty"`
+	// Nil delegates to TDCloud's 1800-second default. Snapshots pin an explicit
+	// choice so configuration edits cannot extend an existing payment attempt.
+	ExpiresIn *int64 `json:"expires_in,omitempty"`
 }
 
 func decodeSettings(raw json.RawMessage) (Settings, error) {
@@ -58,6 +61,7 @@ func NormalizeSettings(raw, previous json.RawMessage) (json.RawMessage, error) {
 	if settings.AmountMetadata != nil {
 		return nil, errors.New("payment amount metadata is managed by the plugin")
 	}
+	settings.NotifyURL = strings.TrimSpace(settings.NotifyURL)
 	if settings.ClientSecret == "" && len(previous) > 0 {
 		old, err := decodeSettings(previous)
 		if err == nil && old.ClientID == settings.ClientID && old.APIURL == settings.APIURL {
@@ -73,16 +77,16 @@ func NormalizeSettings(raw, previous json.RawMessage) (json.RawMessage, error) {
 		}
 	}
 	settings.PaymentNo = "" // New payments always use TDCloud's hosted cashier.
-	if err := validateOptionalCurrencies(settings.Currencies); err != nil {
-		return nil, err
-	}
-	// Legacy test settings are decoded only for compatibility. Administrators
-	// cannot override TDCloud's authoritative invoice units through new config.
+	// Retired manual units are decoded only to normalize historical config.
+	// The decimal contract never uses them.
 	settings.Currencies = nil
-	if _, err := New("validate", settings.APIURL, settings.ClientID, settings.ClientSecret, settings.Currencies, nil); err != nil {
+	if _, err := New("validate", settings.APIURL, settings.ClientID, settings.ClientSecret, nil); err != nil {
 		return nil, err
 	}
 	if err := validateNotificationSettings(settings); err != nil {
+		return nil, err
+	}
+	if err := validateExpiry(settings.ExpiresIn); err != nil {
 		return nil, err
 	}
 	if settings.NotifyEnabled == nil {
@@ -114,16 +118,17 @@ func newFromSettings(id string, raw json.RawMessage, client *http.Client, saved 
 	if err != nil {
 		return nil, err
 	}
-	if !saved {
-		if err := validateOptionalCurrencies(settings.Currencies); err != nil {
-			return nil, err
-		}
+	if !saved && settings.AmountMetadata != nil {
+		return nil, errors.New("active config contains saved metadata")
 	}
-	channel, err := New(id, settings.APIURL, settings.ClientID, settings.ClientSecret, settings.Currencies, client)
+	channel, err := New(id, settings.APIURL, settings.ClientID, settings.ClientSecret, client)
 	if err != nil {
 		return nil, err
 	}
 	if err := validateNotificationSettings(settings); err != nil {
+		return nil, err
+	}
+	if err := validateExpiry(settings.ExpiresIn); err != nil {
 		return nil, err
 	}
 	if saved {
@@ -131,6 +136,7 @@ func newFromSettings(id string, raw json.RawMessage, client *http.Client, saved 
 	}
 	channel.notifyURL, channel.notifySecret = settings.NotifyURL, settings.NotifySecret
 	channel.notifyMode = settings.NotifyMode
+	channel.expiresIn = settings.ExpiresIn
 	if settings.AmountMetadata != nil {
 		if !settings.AmountMetadata.valid() {
 			return nil, errors.New("invalid saved amount metadata")
@@ -186,30 +192,6 @@ func validateNotificationSettings(settings Settings) error {
 	if len(settings.NotifySecret) < 32 || len(settings.NotifySecret) > 256 || settings.NotifySecret == settings.ClientSecret ||
 		strings.IndexFunc(settings.NotifySecret, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
 		return errors.New("TDCloud notification secret must be independent and 32-256 bytes")
-	}
-	return nil
-}
-
-func validateOptionalCurrencies(values map[string]int) error {
-	if len(values) == 0 {
-		return nil
-	}
-	return validateCurrencies(values)
-}
-
-func validateCurrencies(values map[string]int) error {
-	if len(values) == 0 || len(values) > 16 {
-		return errors.New("configure 1-16 invoice currencies and their TDCloud decimal precision")
-	}
-	for code, decimals := range values {
-		if len(code) != 3 || !validDecimals(decimals) {
-			return errors.New("invalid invoice currency precision")
-		}
-		for _, letter := range code {
-			if letter < 'A' || letter > 'Z' {
-				return errors.New("invalid invoice currency code")
-			}
-		}
 	}
 	return nil
 }

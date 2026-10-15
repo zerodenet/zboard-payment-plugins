@@ -80,6 +80,9 @@ func TestNativeSDKPrepareRestartAndConcurrentNotification(t *testing.T) {
 		}
 	}))
 	var paid atomic.Bool
+	var remoteState atomic.Value
+	remoteState.Store("pending")
+	var lookups atomic.Int32
 	var creates atomic.Int32
 	occurred := time.Now().UTC().Truncate(time.Second)
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,23 +93,26 @@ func TestNativeSDKPrepareRestartAndConcurrentNotification(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{"payment_no": "test-usd", "currency": "USD", "currency_decimals": 2}}})
 		case "/openapi/v1/merchant-payments":
 			var in struct {
-				ReturnURL string `json:"return_url"`
-				Amount    int64  `json:"amount_minor"`
-				Reference string `json:"external_reference"`
+				ReturnURL string  `json:"return_url"`
+				Amount    string  `json:"amount"`
+				Minor     *int64  `json:"amount_minor"`
+				Method    *string `json:"payment_no"`
+				Reference string  `json:"external_reference"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&in)
-			if in.Amount != 1050 || in.Reference != "zb-42" || in.ReturnURL != "https://board.example/account/orders?payment_order=42" {
+			if in.Amount != "10.50" || in.Minor != nil || in.Method != nil || in.Reference != "zb-42" || in.ReturnURL != "https://board.example/account/orders?payment_order=42" {
 				t.Errorf("untrusted creation values: %+v", in)
 			}
 			creates.Add(1)
 			w.WriteHeader(201)
-			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "test-usd", "return_url": in.ReturnURL, "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "pending", "checkout_url": "https://pay.example/42", "expires_at": time.Now().Add(time.Hour)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "test-usd", "return_url": in.ReturnURL, "amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "pending", "checkout_url": "https://pay.example/42", "expires_at": time.Now().Add(time.Hour)})
 		case "/openapi/v1/merchant-payments/mp-42":
-			status := "pending"
+			lookups.Add(1)
+			status := remoteState.Load().(string)
 			if paid.Load() {
 				status = "paid"
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "test-usd", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": status, "event_id": "paid-event-42", "provider_trade_no": "trade-42", "occurred_at": occurred})
+			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "test-usd", "amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": status, "event_id": "paid-event-42", "provider_trade_no": "trade-42", "occurred_at": occurred})
 		default:
 			http.NotFound(w, r)
 		}
@@ -123,7 +129,7 @@ func TestNativeSDKPrepareRestartAndConcurrentNotification(t *testing.T) {
 	}
 	s := open()
 	enabled := true
-	settings, _ := json.Marshal(tdcloud.Settings{Currencies: map[string]int{"USD": 2, "CNY": 2, "TDC": 8, "JPY": 0}, APIURL: provider.URL, ClientID: "merchant", ClientSecret: "merchant-secret", PaymentNo: "test-usd", NotifyURL: "https://hooks.example" + tdcloud.NotificationPath, NotifySecret: secret, NotifyEnabled: &enabled})
+	settings, _ := json.Marshal(tdcloud.Settings{APIURL: provider.URL, ClientID: "merchant", ClientSecret: "merchant-secret", PaymentNo: "test-usd", NotifyURL: "https://hooks.example" + tdcloud.NotificationPath, NotifySecret: secret, NotifyEnabled: &enabled})
 	cfg, _ := json.Marshal(config{Channels: []channelConfig{{ID: "tdcloud-main", Name: "TDCloud", Type: "tdcloud", Settings: settings, Enabled: true}}})
 	if _, err := s.ApplyConfig(t.Context(), &pluginv1.ConfigRequest{ConfigJson: cfg}); err != nil {
 		t.Fatal(err)
@@ -133,12 +139,6 @@ func TestNativeSDKPrepareRestartAndConcurrentNotification(t *testing.T) {
 	request := func(action string) *pluginv1.PageActionRequest {
 		return &pluginv1.PageActionRequest{ActorId: principal, Surface: "account", Purpose: "slot", Slot: pluginv1.CheckoutPaymentSlot, SlotId: "payment-methods", Action: action, CheckoutJson: contextJSON, PayloadJson: []byte(`{"option_id":"tdcloud-main"}`)}
 	}
-	if _, err := s.HandlePageAction(t.Context(), request("payments.prepare")); err == nil || creates.Load() != 0 {
-		t.Fatal("manual settings must not bypass missing provider invoice metadata")
-	}
-	// Known legacy metadata isolates SDK/restart/race behavior. This is not a
-	// production automatic-discovery acceptance test.
-	useLegacyFixtureConfig(s, config{Channels: []channelConfig{{ID: "tdcloud-main", Name: "TDCloud", Type: "tdcloud", Settings: settings, Enabled: true}}})
 	prepared, err := s.HandlePageAction(t.Context(), request("payments.prepare"))
 	if err != nil || !strings.Contains(string(prepared.ResultJson), `"checkout_url":"https://pay.example/42"`) || strings.Contains(string(prepared.ResultJson), principal) {
 		t.Fatalf("host prepare: %+v %v", prepared, err)
@@ -156,6 +156,39 @@ func TestNativeSDKPrepareRestartAndConcurrentNotification(t *testing.T) {
 	if creates.Load() != 1 {
 		t.Fatal("denied request created payment")
 	}
+	inspect := func(actor, payload string) actionResult {
+		in := request("payments.inspect")
+		in.ActorId, in.PayloadJson = actor, []byte(payload)
+		response, err := s.HandlePageAction(t.Context(), in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out actionResult
+		if json.Unmarshal(response.ResultJson, &out) != nil {
+			t.Fatal("invalid inspection")
+		}
+		return out
+	}
+	beforeLookup := lookups.Load()
+	for _, item := range []struct{ actor, payload string }{
+		{"forged", `{"order_id":"42"}`}, {"account-authority", `{"order_id":"99"}`},
+		{"account-authority", `{"order_id":"42","account_id":"forged"}`},
+		{"account-authority", `{"order_id":"042"}`},
+	} {
+		if result := inspect(item.actor, item.payload); result.Error == nil {
+			t.Fatalf("unauthorized inspection accepted: %+v", item)
+		}
+	}
+	if lookups.Load() != beforeLookup {
+		t.Fatal("unauthorized inspection contacted provider")
+	}
+	remoteState.Store("review")
+	inspected := inspect("account-authority", `{"order_id":"42"}`)
+	if inspected.Error != nil || inspected.Data.(map[string]any)["provider_state"] != "review" ||
+		inspected.Data.(map[string]any)["state"] != "unknown" || creates.Load() != 1 || settled || len(events) != 0 {
+		t.Fatalf("inspection lost remote status or wrote payment: %+v", inspected)
+	}
+	remoteState.Store("pending")
 	pending, err := s.HandlePageAction(t.Context(), request("payments.reconcile"))
 	if err != nil || !strings.Contains(string(pending.ResultJson), `"state":"pending"`) {
 		t.Fatalf("pending: %+v %v", pending, err)
@@ -169,8 +202,27 @@ func TestNativeSDKPrepareRestartAndConcurrentNotification(t *testing.T) {
 	if historical.Error != nil || !historical.Data.([]any)[0].(map[string]any)["disabled"].(bool) {
 		t.Fatalf("historical option: %+v", historical)
 	}
+	expired, err := s.checkout.ports.Attempts.Get(t.Context(), principal, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired.ExpiresAt = time.Now().Add(-time.Minute)
+	if _, err := s.checkout.ports.Attempts.Put(t.Context(), expired); err != nil {
+		t.Fatal(err)
+	}
+	deadlineMethods := action(t, s, "account-authority", "payments.methods", `{"currency":"USD","order_id":"42"}`)
+	if deadlineMethods.Error != nil || deadlineMethods.Data.([]any)[0].(map[string]any)["checkout_expires_at"] == nil {
+		t.Fatalf("slot did not receive the owned checkout deadline: %+v", deadlineMethods)
+	}
+	for _, action := range []string{"payments.prepare", "payments.reconcile"} {
+		response, err := s.HandlePageAction(t.Context(), request(action))
+		public, ok := pluginv1.ParseActionError(err)
+		if !ok || public.Code != "checkout_expiry_pending" || !public.Retryable || response != nil || creates.Load() != 1 {
+			t.Fatalf("expired unresolved SDK checkout must not reopen or recreate: %+v %v", response, err)
+		}
+	}
 	paid.Store(true)
-	body, _ := json.Marshal(map[string]any{"id": "notification-42", "type": "merchant_payment.status_changed", "api_version": 1, "created_at": occurred, "data": map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "test-usd", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "paid", "status_version": 2, "event_id": "paid-event-42"}})
+	body, _ := json.Marshal(map[string]any{"id": "notification-42", "type": "merchant_payment.status_changed", "api_version": 1, "created_at": occurred, "data": map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "test-usd", "amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "paid", "status_version": 2, "event_id": "paid-event-42"}})
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(timestamp + "."))

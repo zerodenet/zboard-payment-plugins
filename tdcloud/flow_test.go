@@ -88,7 +88,7 @@ func TestTDCloudCheckoutAndRacingConfirmationsFulfillOnce(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "return_url": input.ReturnURL,
-				"payment_no": "stripe-usd", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "pending",
+				"payment_no": "stripe-usd", "amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "pending",
 				"checkout_url": "https://checkout.example.test/mp-42", "expires_at": time.Now().Add(time.Hour)})
 		case "/openapi/v1/merchant-payments/mp-42":
 			status := "pending"
@@ -96,13 +96,13 @@ func TestTDCloudCheckoutAndRacingConfirmationsFulfillOnce(t *testing.T) {
 				status = "paid"
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "stripe-usd",
-				"amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": status, "event_id": "event-42", "provider_trade_no": "trade-42", "occurred_at": occurred})
+				"amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": status, "event_id": "event-42", "provider_trade_no": "trade-42", "occurred_at": occurred})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer provider.Close()
-	channel, err := tdcloud.New("tdcloud", provider.URL, "client", "secret", map[string]int{"CNY": 2, "USD": 2}, provider.Client())
+	channel, err := tdcloud.New("tdcloud", provider.URL, "client", "secret", provider.Client())
 	if err != nil {
 		t.Fatal(err)
 	}

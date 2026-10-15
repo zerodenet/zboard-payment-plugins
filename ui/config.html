@@ -25,6 +25,19 @@
 <body><main id="config"><p role="status">正在加载支付渠道配置</p></main>
 <script type="module">
   import { mountConfigEntry } from "./config-entry.mjs";
-  void mountConfigEntry(document.getElementById("config"));
+  import { mountPaymentReviews } from "./reviews-entry.mjs";
+  import { createPluginBridge } from "./plugin-bridge.mjs";
+  const bridge = createPluginBridge();
+  const root = document.getElementById("config");
+  try {
+    const context = await bridge.request("context.load");
+    if (context.surface === "admin" && context.page_id === "payment-reviews") {
+      await mountPaymentReviews(root, { bridge });
+    } else {
+      await mountConfigEntry(root, { bridge });
+    }
+  } catch {
+    root.textContent = "无法加载插件页面，请刷新重试。";
+  }
 </script></body>
 </html>

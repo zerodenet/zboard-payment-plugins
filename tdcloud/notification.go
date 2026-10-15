@@ -31,6 +31,7 @@ type Notification struct {
 		PaymentNo         string    `json:"payment_no"`
 		Status            string    `json:"status"`
 		StatusVersion     uint64    `json:"status_version"`
+		Amount            string    `json:"amount"`
 		AmountMinor       int64     `json:"amount_minor"`
 		Currency          string    `json:"currency"`
 		CurrencyDecimals  *int      `json:"currency_decimals"`
@@ -82,9 +83,15 @@ func parseNotification(body []byte) (Notification, error) {
 	if err := json.Unmarshal(body, &event); err != nil || event.ID == "" ||
 		event.Type != "merchant_payment.status_changed" || event.APIVersion != 1 || event.CreatedAt.IsZero() ||
 		event.Data.OrderNo == "" || event.Data.ExternalReference == "" ||
-		event.Data.StatusVersion == 0 || event.Data.AmountMinor <= 0 || event.Data.AmountMinor > maxProviderMinor || len(event.Data.Currency) != 3 ||
-		event.Data.CurrencyDecimals == nil || !validDecimals(*event.Data.CurrencyDecimals) {
+		event.Data.StatusVersion == 0 || !validCurrency(event.Data.Currency) {
 		return Notification{}, ErrInvalidNotification
+	}
+	if event.Data.Amount != "" {
+		if _, err := parseHostAmount(event.Data.Amount); err != nil {
+			return Notification{}, ErrInvalidNotification
+		}
+	} else if event.Data.AmountMinor <= 0 || event.Data.AmountMinor > maxProviderMinor || event.Data.CurrencyDecimals == nil || !validDecimals(*event.Data.CurrencyDecimals) {
+		return Notification{}, ErrInvalidNotification // historical signed snapshots
 	}
 	switch event.Data.Status {
 	case "pending", "review", "paid", "expired", "refunded", "chargeback":
@@ -109,10 +116,10 @@ func (c *Client) InspectNotification(body []byte, headers http.Header, now time.
 	if err != nil || (c.legacyPaymentNo != "" && event.Data.PaymentNo != c.legacyPaymentNo) {
 		return payment.NotificationHint{}, ErrInvalidNotification
 	}
-	amount, err := c.normalizeAmount(event.Data.AmountMinor, event.Data.Currency, event.Data.CurrencyDecimals)
+	amount, err := c.resultAmount(event.Data.Amount, event.Data.AmountMinor, event.Data.Currency, event.Data.CurrencyDecimals)
 	if err != nil {
 		return payment.NotificationHint{}, ErrInvalidNotification
 	}
 	return payment.NotificationHint{ProviderOrderID: event.Data.OrderNo, Reference: event.Data.ExternalReference,
-		AmountMinor: amount, Currency: event.Data.Currency, Status: event.Data.Status}, nil
+		AmountMinor: amount, Currency: event.Data.Currency, Status: event.Data.Status, StatusVersion: event.Data.StatusVersion}, nil
 }

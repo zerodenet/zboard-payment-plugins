@@ -11,7 +11,7 @@ import (
 	pluginv1 "github.com/zerodenet/zboard/backend/pkg/pluginapi/v1"
 )
 
-func TestRuntimeHealthDoesNotClaimPaymentReadyWithoutInvoiceMetadata(t *testing.T) {
+func TestRuntimePaymentReadinessDoesNotRequireInvoiceMetadata(t *testing.T) {
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/token":
@@ -33,8 +33,8 @@ func TestRuntimeHealthDoesNotClaimPaymentReadyWithoutInvoiceMetadata(t *testing.
 		"settings": tdcloud.Settings{Currencies: map[string]int{"USD": 2, "CNY": 2, "TDC": 8, "JPY": 0}, APIURL: provider.URL, ClientID: "client", ClientSecret: "secret", PaymentNo: "wallet"},
 	}}})
 	result, err := s.TestConfig(t.Context(), &pluginv1.ConfigRequest{ConfigJson: config})
-	if err != nil || result.Healthy {
-		t.Fatalf("cashier access and manual units cannot establish invoice metadata: %+v %v", result, err)
+	if err != nil || !result.Healthy {
+		t.Fatalf("decimal contract must allow configuration-only merchant access: %+v %v", result, err)
 	}
 }
 

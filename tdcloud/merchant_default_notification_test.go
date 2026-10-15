@@ -24,16 +24,15 @@ func TestMerchantDefaultNotificationUsesPlatformKeyWithoutOverridingProviderConf
 				t.Fatal("plugin replaced the platform default notification identity")
 			}
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp", ExternalRef: "zb", AmountMinor: 1050, Currency: "USD", CurrencyDecimals: intPointer(2), Status: "pending", CheckoutURL: "https://cashier.example.test/mp"})
+			_ = json.NewEncoder(w).Encode(merchantPayment{OrderNo: "mp", ExternalRef: "zb", Amount: "10.50", AmountMinor: 1050, Currency: "USD", CurrencyDecimals: intPointer(2), Status: "pending", CheckoutURL: "https://cashier.example.test/mp"})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer provider.Close()
 	enabled := true
-	// Pinned amount metadata isolates notification behavior; currency discovery
-	// remains a separate unavailable production dependency.
-	raw, _ := json.Marshal(Settings{APIURL: provider.URL, ClientID: "merchant", ClientSecret: "oauth-secret", NotifyMode: "merchant_default", NotifyEnabled: &enabled, NotifyURL: "https://board.example.test" + NotificationPath, NotifySecret: signingKey, AmountMetadata: &AmountMetadata{Version: 1, Currency: "USD", Decimals: 2}})
+	// Decimal snapshot uses the platform notification identity unchanged.
+	raw, _ := json.Marshal(Settings{APIURL: provider.URL, ClientID: "merchant", ClientSecret: "oauth-secret", NotifyMode: "merchant_default", NotifyEnabled: &enabled, NotifyURL: "https://board.example.test" + NotificationPath, NotifySecret: signingKey, AmountMetadata: &AmountMetadata{Version: 2, Currency: "USD"}})
 	client, err := NewFromSnapshot("tdcloud", raw, provider.Client())
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +41,7 @@ func TestMerchantDefaultNotificationUsesPlatformKeyWithoutOverridingProviderConf
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	body, _ := json.Marshal(map[string]any{"id": "notice", "type": "merchant_payment.status_changed", "api_version": 1, "created_at": now, "data": map[string]any{"order_no": "mp", "external_reference": "zb", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "paid", "status_version": 2}})
+	body, _ := json.Marshal(map[string]any{"id": "notice", "type": "merchant_payment.status_changed", "api_version": 1, "created_at": now, "data": map[string]any{"order_no": "mp", "external_reference": "zb", "amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "paid", "status_version": 2}})
 	stamp := strconv.FormatInt(now.Unix(), 10)
 	headers := http.Header{"X-Tdcloud-Event-Id": {"notice"}, "X-Tdcloud-Timestamp": {stamp}, "X-Tdcloud-Signature": {signedNotification(body, stamp, signingKey)}}
 	if _, err := client.InspectNotification(body, headers, now); err != nil {

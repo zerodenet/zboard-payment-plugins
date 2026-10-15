@@ -79,6 +79,9 @@ func (s *Server) testChannels(ctx context.Context, c config) *pluginv1.HealthRes
 				entry.Connected = &connected
 				if err != nil {
 					entry.Code = "connection_failed"
+					if diagnose := channelProviders[item.Type].diagnose; diagnose != nil {
+						entry.Code, connected = diagnose(err)
+					}
 				}
 			}
 			results <- entry

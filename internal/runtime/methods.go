@@ -28,12 +28,13 @@ type methodsFlight struct {
 // Method is the public checkout choice projected from a configured channel.
 // A method ID is selected before ZBoard creates its business order.
 type Method struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Currency      string `json:"currency"`
-	LoginRequired bool   `json:"login_required"`
-	TestMode      bool   `json:"test_mode"`
-	Disabled      bool   `json:"disabled,omitempty"`
+	ID                string     `json:"id"`
+	Name              string     `json:"name"`
+	Currency          string     `json:"currency"`
+	LoginRequired     bool       `json:"login_required"`
+	TestMode          bool       `json:"test_mode"`
+	Disabled          bool       `json:"disabled,omitempty"`
+	CheckoutExpiresAt *time.Time `json:"checkout_expires_at,omitempty"`
 }
 
 // ListMethods is independent of the eventual ZBoard checkout slot transport.
@@ -143,7 +144,7 @@ collected:
 			continue
 		}
 		remote := infos[index]
-		supported := strings.EqualFold(remote.Currency, currency)
+		supported := remote.ValidateCurrencyAtCheckout || strings.EqualFold(remote.Currency, currency)
 		for _, code := range remote.Currencies {
 			supported = supported || strings.EqualFold(code, currency)
 		}

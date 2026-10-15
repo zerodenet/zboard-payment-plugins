@@ -1,0 +1,67 @@
+name: Checks
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: false
+        default: ''
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sh scripts/check.sh
+      - name: Verify module lockfiles
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: Fetch pinned host
+        uses: actions/checkout@v4
+        with:
+          repository: zerodenet/zboard
+          ref: 505d0b728ea6d3fd78730326718b2446bdef9a7b
+          path: .local/host
+          persist-credentials: false
+      - name: Verify host integration
+        env:
+          ZBOARD_DIR: ${{ github.workspace }}/.local/host
+        run: python3 scripts/check-host-integration.py
+      - name: Build signed development packages
+        env:
+          ZBOARD_DIR: ${{ github.workspace }}/.local/host
+        run: |
+          go -C "$ZBOARD_DIR/backend" run ./tools/pluginpackager -keygen "$RUNNER_TEMP/payments-ci.key"
+          for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            scripts/build-package.sh "$PWD/dist/zboard-payments-dev-$platform.zbplugin" "$RUNNER_TEMP/payments-ci.key" payments-ci-dev "$platform"
+          done
+      - name: Upload development packages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: payments-development-${{ github.sha }}
+          path: dist/*-dev-*.zbplugin
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove development key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/payments-ci.key" "$RUNNER_TEMP/payments-ci.key.pub"

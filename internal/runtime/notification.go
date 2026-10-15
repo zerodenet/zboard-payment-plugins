@@ -30,6 +30,10 @@ func (c *CheckoutCoordinator) ConfirmNotification(ctx context.Context, accountID
 	if err != nil {
 		return CheckoutView{}, err
 	}
+	return c.confirmAttemptNotification(ctx, attempt, body, headers, now)
+}
+
+func (c *CheckoutCoordinator) confirmAttemptNotification(ctx context.Context, attempt payment.Attempt, body []byte, headers http.Header, now time.Time) (CheckoutView, error) {
 	if attempt.ProviderOrderID == "" || len(attempt.ChannelSnapshot) == 0 {
 		return CheckoutView{}, payment.ErrPending
 	}
@@ -49,11 +53,15 @@ func (c *CheckoutCoordinator) ConfirmNotification(ctx context.Context, accountID
 		hint.AmountMinor != attempt.AmountMinor || !strings.EqualFold(hint.Currency, attempt.Currency) {
 		return CheckoutView{}, payment.ErrConflict
 	}
-	view, err := c.Confirm(ctx, accountID, orderID)
+	service := payment.Service{Orders: c.ports.Orders, Facts: c.ports.Facts, Attempts: c.ports.Attempts, ResolveChannel: c.resolveChannel}
+	force := !(attempt.State == "paid" && attempt.FactState == "recorded" && (hint.Status == "paid" || hint.StatusVersion <= attempt.ProviderVersion))
+	root, err := service.ReconcileProvider(ctx, attempt.AccountID, attempt.OrderID, attempt.ChannelID, hint.ProviderOrderID, hint.StatusVersion, force)
+	view := checkoutView(root)
 	if err != nil {
 		return view, err
 	}
-	if hint.Status == "paid" && view.State != "paid" {
+	checked, found := payment.FindAttempt(root, attempt.ChannelID, hint.ProviderOrderID)
+	if hint.Status == "paid" && (!found || checked.VerifiedFact == nil) {
 		return view, payment.ErrPending
 	}
 	return view, nil

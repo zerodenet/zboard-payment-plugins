@@ -22,6 +22,7 @@ import (
 func TestTDCloudNotificationVerifiesAttemptThenUsesServerLookup(t *testing.T) {
 	var paid atomic.Bool
 	var lookups atomic.Int32
+	occurred := time.Now().UTC().Truncate(time.Second)
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/token":
@@ -33,8 +34,8 @@ func TestTDCloudNotificationVerifiesAttemptThenUsesServerLookup(t *testing.T) {
 				status = "paid"
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"order_no": "mp-42", "external_reference": "zb-42", "payment_no": "stripe-usd",
-				"amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": status, "event_id": "payment-event-42",
-				"provider_trade_no": "trade-42", "occurred_at": time.Now().UTC()})
+				"amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": status, "event_id": "payment-event-42",
+				"provider_trade_no": "trade-42", "occurred_at": occurred})
 		default:
 			http.NotFound(w, r)
 		}
@@ -57,7 +58,7 @@ func TestTDCloudNotificationVerifiesAttemptThenUsesServerLookup(t *testing.T) {
 	makeEvent := func(orderNo string) []byte {
 		body, _ := json.Marshal(map[string]any{"id": "notification-42", "type": "merchant_payment.status_changed", "api_version": 1, "created_at": now,
 			"data": map[string]any{"order_no": orderNo, "external_reference": "zb-42", "payment_no": "stripe-usd",
-				"amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "paid", "status_version": 2, "event_id": "payment-event-42"}})
+				"amount": "10.50", "amount_minor": 1050, "currency": "USD", "currency_decimals": 2, "status": "paid", "status_version": 2, "event_id": "payment-event-42"}})
 		return body
 	}
 	sign := func(body []byte) string {

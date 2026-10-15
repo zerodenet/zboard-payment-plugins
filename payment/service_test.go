@@ -32,7 +32,7 @@ func (s *testStore) Get(_ context.Context, account string, id uint64) (Attempt, 
 	if !ok {
 		return Attempt{}, ErrNotFound
 	}
-	return a, nil
+	return CloneAttempt(a), nil
 }
 
 func (s *testStore) Put(_ context.Context, a Attempt) (Attempt, error) {
@@ -44,7 +44,7 @@ func (s *testStore) Put(_ context.Context, a Attempt) (Attempt, error) {
 		return Attempt{}, ErrConflict
 	}
 	a.Revision++
-	s.attempts[key] = a
+	s.attempts[key] = CloneAttempt(a)
 	return a, nil
 }
 
@@ -213,6 +213,28 @@ func TestUnknownResultNeverSettles(t *testing.T) {
 	attempt, err := s.Reconcile(t.Context(), "account-1", 7)
 	if err != nil || attempt.State != "pending" || len(facts.calls) != 0 {
 		t.Fatalf("unknown result settled: %+v %v %+v", attempt, err, facts.calls)
+	}
+}
+
+func TestPaidResultsRequireCompletePaymentIdentityAndTime(t *testing.T) {
+	for _, missing := range []string{"event", "trade", "time"} {
+		s, channel, facts := fixture()
+		if _, err := s.Start(t.Context(), "account-1", 7, "test", ""); err != nil {
+			t.Fatal(err)
+		}
+		channel.result = PaymentResult{ProviderOrderID: "provider-1", Reference: "zboard-7", Status: "paid", AmountMinor: 1200, Currency: "CNY", EventID: "event", ProviderTradeNo: "trade", OccurredAt: time.Now()}
+		switch missing {
+		case "event":
+			channel.result.EventID = ""
+		case "trade":
+			channel.result.ProviderTradeNo = ""
+		case "time":
+			channel.result.OccurredAt = time.Time{}
+		}
+		attempt, err := s.Reconcile(t.Context(), "account-1", 7)
+		if !errors.Is(err, ErrConflict) || attempt.State != "pending" || len(facts.calls) != 0 {
+			t.Fatalf("incomplete %s settled: %+v %v", missing, attempt, err)
+		}
 	}
 }
 

@@ -117,7 +117,21 @@ func (s *storage) FindByProviderOrder(ctx context.Context, providerType, orderNo
 		return payment.Attempt{}, err
 	}
 	if attempt.ProviderOrderID != orderNo {
-		return payment.Attempt{}, payment.ErrNotFound // an index from a superseded attempt
+		found := false
+		for _, historical := range attempt.History {
+			if historical.ProviderOrderID != orderNo {
+				continue
+			}
+			var old providerSnapshot
+			if json.Unmarshal(historical.ChannelSnapshot, &old) != nil || old.Type != providerType {
+				continue
+			}
+			attempt, found = historical, true
+			break
+		}
+		if !found {
+			return payment.Attempt{}, payment.ErrHistoricalUnavailable
+		}
 	}
 	var snapshot providerSnapshot
 	if err := json.Unmarshal(attempt.ChannelSnapshot, &snapshot); err != nil || snapshot.Type != providerType {
@@ -177,6 +191,14 @@ func (s *storage) Put(ctx context.Context, attempt payment.Attempt) (payment.Att
 		// while a callback never sees an unindexed published provider order.
 		if err := s.ensureProviderOrderIndex(ctx, attempt); err != nil {
 			return payment.Attempt{}, err
+		}
+		for _, historical := range attempt.History {
+			if historical.AccountID != attempt.AccountID || historical.OrderID != attempt.OrderID || len(historical.History) != 0 {
+				return payment.Attempt{}, payment.ErrConflict
+			}
+			if err := s.ensureProviderOrderIndex(ctx, historical); err != nil {
+				return payment.Attempt{}, err
+			}
 		}
 		next := attempt
 		next.Revision++

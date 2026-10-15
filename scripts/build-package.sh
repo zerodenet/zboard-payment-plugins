@@ -29,7 +29,12 @@ if [ -n "$key" ]; then
 fi
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-board_backend=$(CDPATH= cd -- "$root/../zboard/backend" && pwd)
+board_backend=$(CDPATH= cd -- "${ZBOARD_DIR:-$root/../zboard}/backend" && pwd)
+export GOWORK=off
+if [ "${CI:-}" = true ] && [ -z "$key" ]; then
+  echo "CI packages require an explicit signing key and publisher ID" >&2
+  exit 2
+fi
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
 python3 - "$root/manifest.json" "$stage/manifest.json" "$target" <<'PY'
@@ -53,10 +58,10 @@ for platform in $targets; do
   os=${platform%-*}
   arch=${platform#*-}
   mkdir -p "$stage/runtimes/$platform"
-  (cd "$root" && CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags='-s -w' -o "$stage/runtimes/$platform/payments" ./cmd/payments)
+  (cd "$root" && CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -buildvcs=false -trimpath -ldflags='-s -w' -o "$stage/runtimes/$platform/payments" ./cmd/payments)
 done
 mkdir -p "$stage/ui"
-cp "$root/ui/payment.html" "$root/ui/payment-entry.mjs" "$root/ui/plugin-bridge.mjs" "$root/ui/payment-flow.mjs" "$root/ui/payment-widget.mjs" "$root/ui/config.html" "$root/ui/config-entry.mjs" "$root/ui/channel-config-providers.mjs" "$root/ui/tdcloud-config.mjs" "$stage/ui/"
+cp "$root/ui/payment.html" "$root/ui/payment-entry.mjs" "$root/ui/plugin-bridge.mjs" "$root/ui/payment-flow.mjs" "$root/ui/payment-widget.mjs" "$root/ui/config.html" "$root/ui/config-entry.mjs" "$root/ui/reviews-entry.mjs" "$root/ui/channel-config-providers.mjs" "$root/ui/tdcloud-config.mjs" "$stage/ui/"
 
 mkdir -p "$(dirname -- "$output")"
 if [ -n "$key" ]; then

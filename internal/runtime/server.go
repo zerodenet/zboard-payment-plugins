@@ -100,7 +100,7 @@ type Server struct {
 
 func New() *Server { return &Server{} }
 
-var pluginCapabilities = []string{"zboard.ui.page.v1", "zboard.ui.slot.v1", "zboard.config.v1", "zboard.storage.v1", "zboard.http.route.v1", pluginv1.CommerceOrdersReadCapability, pluginv1.CommercePaymentsWriteCapability}
+var pluginCapabilities = []string{"zboard.ui.page.v1", "zboard.ui.slot.v1", "zboard.config.v1", "zboard.storage.v1", "zboard.http.route.v1", "zboard.task.v1", pluginv1.CommerceOrdersReadCapability, pluginv1.CommercePaymentsWriteCapability}
 
 func (*Server) GetInfo(context.Context, *pluginv1.Empty) (*pluginv1.Info, error) {
 	return &pluginv1.Info{Id: pluginID, Version: pluginVersion, Protocol: pluginv1.ProtocolVersion,

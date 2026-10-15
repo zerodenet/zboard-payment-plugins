@@ -10,7 +10,7 @@ import (
 
 func intPointer(value int) *int { return &value }
 
-func TestMinorUnitsConvertExactlyWithoutRoundingOrOverflow(t *testing.T) {
+func TestHistoricalIntegerSnapshotsPreserveExactUnitsWithoutRoundingOrOverflow(t *testing.T) {
 	for _, item := range []struct {
 		name     string
 		host     int64

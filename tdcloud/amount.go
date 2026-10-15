@@ -4,103 +4,100 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"math"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/zerodenet/zboard-pay-plugins/payment"
 )
 
-// TDCloud owns invoice units. Missing provider metadata cannot be replaced
-// by merchant input, cashier-method precision or an assumed two-decimal value.
-var ErrCurrencyMetadataUnavailable = payment.ErrProviderMetadataUnavailable
-
-const hostDecimals = 2
-const maxProviderMinor int64 = 9007199254740991
-
-// AmountMetadata is pinned inside private checkout settings before first
-// create. Directory changes never change an ambiguous attempt's amount units.
+// Version 2 pins the decimal wire contract and invoice currency, not TDCloud
+// precision. Version 1 is read only for already-issued integer-wire attempts.
 type AmountMetadata struct {
 	Version  int    `json:"version"`
 	Currency string `json:"currency"`
-	Decimals int    `json:"decimals"`
+	Decimals int    `json:"decimals,omitempty"`
 }
 
-func validDecimals(decimals int) bool { return decimals >= 0 && decimals <= 8 }
+func validCurrency(code string) bool {
+	if len(code) != 3 {
+		return false
+	}
+	for _, c := range code {
+		if c < 'A' || c > 'Z' {
+			return false
+		}
+	}
+	return true
+}
 func (m AmountMetadata) valid() bool {
-	return m.Version == 1 && len(m.Currency) == 3 && m.Currency == strings.ToUpper(m.Currency) && validDecimals(m.Decimals)
+	return validCurrency(m.Currency) && ((m.Version == 1 && validDecimals(m.Decimals)) || (m.Version == 2 && m.Decimals == 0))
 }
 
-func scaleMinor(amount int64, from, to int) (int64, error) {
-	if amount <= 0 || !validDecimals(from) || !validDecimals(to) {
-		return 0, payment.ErrAmountPrecision
+// ZBoard's known cents become decimal text with no provider-unit conversion.
+func formatHostAmount(minor int64) (string, error) {
+	if minor <= 0 {
+		return "", payment.ErrAmountPrecision
 	}
-	factor := int64(1)
-	if from < to {
-		for n := from; n < to; n++ {
-			factor *= 10
+	return fmt.Sprintf("%d.%02d", minor/100, minor%100), nil
+}
+
+// TDCloud returns ordinary decimal invoice text (including trailing zeros).
+// Parse exactly into ZBoard cents without float arithmetic or rounding.
+func parseHostAmount(value string) (int64, error) {
+	if len(value) == 0 || len(value) > 64 {
+		return 0, payment.ErrConflict
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) > 2 {
+		return 0, payment.ErrConflict
+	}
+	for _, part := range parts {
+		if part == "" {
+			return 0, payment.ErrConflict
 		}
-		if amount > math.MaxInt64/factor {
-			return 0, payment.ErrAmountPrecision
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return 0, payment.ErrConflict
+			}
 		}
-		return amount * factor, nil
 	}
-	for n := to; n < from; n++ {
-		factor *= 10
+	fraction := ""
+	if len(parts) == 2 {
+		fraction = strings.TrimRight(parts[1], "0")
 	}
-	if amount%factor != 0 {
-		return 0, payment.ErrAmountPrecision
+	if len(fraction) > 2 {
+		return 0, payment.ErrConflict
 	}
-	return amount / factor, nil
+	digits := strings.TrimLeft(parts[0]+fraction+strings.Repeat("0", 2-len(fraction)), "0")
+	minor, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil || minor <= 0 {
+		return 0, payment.ErrConflict
+	}
+	return minor, nil
 }
 
-func toProviderMinor(amount int64, decimals int) (int64, error) {
-	value, err := scaleMinor(amount, hostDecimals, decimals)
-	if err != nil || value > maxProviderMinor {
-		return 0, payment.ErrAmountPrecision
-	}
-	return value, nil
-}
-
-func (c *Client) normalizeAmount(amount int64, currency string, decimals *int) (int64, error) {
-	if decimals == nil || !validDecimals(*decimals) || amount <= 0 || amount > maxProviderMinor || len(currency) != 3 {
+func (c *Client) resultAmount(amount string, minor int64, currency string, decimals *int) (int64, error) {
+	if !validCurrency(currency) || (c.amount != nil && c.amount.Currency != currency) {
 		return 0, payment.ErrConflict
 	}
-	if c.amount != nil && (!strings.EqualFold(currency, c.amount.Currency) || *decimals != c.amount.Decimals) {
-		return 0, payment.ErrConflict
-	}
-	if c.legacyAmount && *decimals != hostDecimals {
-		return 0, payment.ErrConflict
-	}
-	value, err := scaleMinor(amount, *decimals, hostDecimals)
-	if err != nil {
-		return 0, payment.ErrConflict
-	}
-	return value, nil
-}
-
-func (c *Client) resolveAmount(ctx context.Context, currency string) (AmountMetadata, error) {
-	if c.amount != nil {
-		if !strings.EqualFold(currency, c.amount.Currency) {
-			return AmountMetadata{}, payment.ErrConflict
+	if c.usesLegacyAmount() {
+		value, err := c.normalizeAmount(minor, currency, decimals)
+		if err != nil {
+			return 0, err
 		}
-		return *c.amount, nil
+		if amount != "" {
+			parsed, err := parseHostAmount(amount)
+			if err != nil || parsed != value {
+				return 0, payment.ErrConflict
+			}
+		}
+		return value, nil
 	}
-	if c.legacyAmount {
-		// Old attempts sent host minor units without conversion. Preserve that
-		// exact request; never reinterpret its idempotency key with new units.
-		return AmountMetadata{Version: 1, Currency: strings.ToUpper(currency), Decimals: hostDecimals}, nil
-	}
-	if len(c.currencies) == 0 {
-		return AmountMetadata{}, ErrCurrencyMetadataUnavailable
-	}
-	decimals, ok := c.currencies[strings.ToUpper(currency)]
-	if !ok {
-		return AmountMetadata{}, payment.ErrConflict
-	}
-	return AmountMetadata{Version: 1, Currency: strings.ToUpper(currency), Decimals: decimals}, nil
+	return parseHostAmount(amount)
 }
 
-func (c *Client) PrepareSnapshot(ctx context.Context, raw []byte, currency string) (payment.Channel, []byte, error) {
+func (c *Client) PrepareSnapshot(_ context.Context, raw []byte, currency string) (payment.Channel, []byte, error) {
 	settings, err := decodeSettings(raw)
 	if err != nil {
 		return nil, nil, err
@@ -108,12 +105,12 @@ func (c *Client) PrepareSnapshot(ctx context.Context, raw []byte, currency strin
 	if settings.AmountMetadata != nil {
 		return nil, nil, errors.New("active config contains saved metadata")
 	}
-	metadata, err := c.resolveAmount(ctx, currency)
-	if err != nil {
-		return nil, nil, err
+	if !validCurrency(currency) {
+		return nil, nil, payment.ErrConflict
 	}
 	settings.PaymentNo = ""
-	settings.AmountMetadata = &metadata
+	settings.Currencies = nil
+	settings.AmountMetadata = &AmountMetadata{Version: 2, Currency: currency}
 	snapshot, err := json.Marshal(settings)
 	if err != nil {
 		return nil, nil, err
@@ -122,6 +119,6 @@ func (c *Client) PrepareSnapshot(ctx context.Context, raw []byte, currency strin
 	if err != nil {
 		return nil, nil, err
 	}
-	prepared.auth = c.auth // OAuth identity is unchanged; amount metadata is immutable.
+	prepared.auth = c.auth
 	return prepared, snapshot, nil
 }

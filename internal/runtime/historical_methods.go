@@ -33,8 +33,13 @@ func (s *Server) historicalMethods(ctx context.Context, actor, id, currency stri
 	if err != nil {
 		return nil, err
 	}
-	for _, method := range methods {
+	var expiresAt = &attempt.ExpiresAt
+	if attempt.State != "pending" || attempt.ExpiresAt.IsZero() {
+		expiresAt = nil
+	}
+	for index, method := range methods {
 		if method.ID == attempt.ChannelID {
+			methods[index].CheckoutExpiresAt = expiresAt
 			return methods, nil
 		}
 	}
@@ -47,5 +52,5 @@ func (s *Server) historicalMethods(ctx context.Context, actor, id, currency stri
 	if len(methods) >= 16 {
 		methods = methods[:15]
 	}
-	return append(methods, Method{ID: attempt.ChannelID, Name: name, Currency: currency, Disabled: true}), nil
+	return append(methods, Method{ID: attempt.ChannelID, Name: name, Currency: currency, Disabled: true, CheckoutExpiresAt: expiresAt}), nil
 }

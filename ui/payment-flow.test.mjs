@@ -92,6 +92,23 @@ test("blocked popup leaves business order untouched and offers retry", async () 
   assert.match(flow.getState().message, /拦截/);
 });
 
+test("an unresolved expired checkout closes the blank window and explains the same-order retry", async () => {
+  let orders = 0, closed = 0, navigations = 0;
+  const flow = createPaymentFlow({
+    listMethods: async () => [{ id: "tdcloud", currency: "USD" }],
+    openWindow: () => ({ close: () => closed++, location: { replace: () => navigations++ } }),
+    createOrder: async () => ({ id: String(++orders) }),
+    startCheckout: async () => { throw { code: "checkout_expiry_pending" }; },
+  });
+  await flow.load("USD");
+  await flow.pay();
+  await flow.pay();
+  assert.equal(orders, 1);
+  assert.equal(closed, 2);
+  assert.equal(navigations, 0);
+  assert.match(flow.getState().message, /超时.*核对原收款/);
+});
+
 test("a resumed provider checkout without a redirect proceeds to verification", async () => {
   let closed = false;
   const flow = createPaymentFlow({

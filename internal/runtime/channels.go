@@ -17,6 +17,7 @@ type channelProvider struct {
 	project   func(json.RawMessage) (json.RawMessage, error)
 	build     func(string, json.RawMessage, *http.Client) (payment.Channel, error)
 	restore   func(string, json.RawMessage, *http.Client) (payment.Channel, error)
+	diagnose  func(error) (code string, connected bool)
 }
 
 // New providers join this registry while checkout, reconciliation and method
@@ -25,6 +26,7 @@ var channelProviders = map[string]channelProvider{
 	"tdcloud": {
 		normalize: tdcloud.NormalizeSettings,
 		project:   tdcloud.ProjectSettings,
+		diagnose:  tdcloud.ConnectionDiagnostic,
 		build: func(id string, raw json.RawMessage, client *http.Client) (payment.Channel, error) {
 			return tdcloud.NewFromSettings(id, raw, client)
 		},
