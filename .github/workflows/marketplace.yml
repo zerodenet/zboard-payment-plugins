@@ -1,0 +1,64 @@
+name: Publisher marketplace metadata
+on:
+  push:
+    branches: [master]
+    paths:
+      - marketplace-listing.json
+      - scripts/marketplace.py
+      - .github/workflows/marketplace.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published release to describe
+        type: string
+        default: v0.0.1
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: payments-marketplace-metadata
+  cancel-in-progress: false
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read existing release and signed packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || 'v0.0.1' }}
+        run: |
+          mkdir -p dist
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > dist/github-release.json
+          python3 -c 'import json; r=json.load(open("dist/github-release.json")); assert not r["draft"] and not r["prerelease"]'
+          gh release download "$RELEASE_TAG" --pattern '*.zbplugin' --pattern 'release-metadata.json' --dir dist
+          published_at=$(python3 -c 'import json; print(json.load(open("dist/github-release.json"))["published_at"])')
+          python3 scripts/marketplace.py --tag "$RELEASE_TAG" --published-at "$published_at"
+      - name: Fetch pinned marketplace schema
+        uses: actions/checkout@v4
+        with:
+          repository: zerodenet/plugins
+          ref: 01465faf077ae06395c41a11fac3c4d63cec22cf
+          path: .local/marketplace
+          persist-credentials: false
+      - name: Validate registration and release contracts
+        run: |
+          PYTHONPATH=.local/marketplace/scripts python3 -c 'import json; from marketplace_schema import validate_release_manifest; validate_release_manifest(json.load(open("dist/marketplace-entry.json")))'
+      - name: Add missing metadata without overwriting release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || 'v0.0.1' }}
+        run: |
+          if gh release download "$RELEASE_TAG" --pattern marketplace-entry.json --dir "$RUNNER_TEMP/existing-metadata"; then
+            cmp dist/marketplace-entry.json "$RUNNER_TEMP/existing-metadata/marketplace-entry.json"
+          else
+            gh release upload "$RELEASE_TAG" dist/marketplace-entry.json
+          fi

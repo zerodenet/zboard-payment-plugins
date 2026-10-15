@@ -1,0 +1,42 @@
+{
+  "id": "zboard.payments",
+  "name": "Payment Channels for ZBoard",
+  "description": "Provider-neutral payment channels with a TDCloud hosted cashier adapter.",
+  "categories": [
+    "payment"
+  ],
+  "license": "MPL-2.0",
+  "maintainers": [
+    "kovawx"
+  ],
+  "repository": "https://github.com/zerodenet/zboard-payment-plugins",
+  "documentation": "https://github.com/zerodenet/zboard-payment-plugins/blob/master/README.md",
+  "publisher": {
+    "id": "zerodenet",
+    "public_key": "kcMlhhSKOpfp0XLfWMMfKL4smXaa+ybMWfGRuSuyKJU="
+  },
+  "release_source": {
+    "type": "github-releases",
+    "metadata_asset": "marketplace-entry.json"
+  },
+  "targets": [
+    {
+      "host": "zboard",
+      "package_id": "zboard.payments",
+      "surfaces": [
+        "account",
+        "admin"
+      ],
+      "capabilities": [
+        "zboard.ui.page.v1",
+        "zboard.ui.slot.v1",
+        "zboard.config.v1",
+        "zboard.storage.v1",
+        "zboard.http.route.v1",
+        "zboard.task.v1",
+        "zboard.commerce.orders.read.v1",
+        "zboard.commerce.payments.write.v1"
+      ]
+    }
+  ]
+}

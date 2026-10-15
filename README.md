@@ -151,3 +151,7 @@ The package version remains `0.0.1`. Private data schema 2 reads existing schema
 - Variable `PLUGIN_PUBLIC_KEY`: the corresponding base64 public key.
 
 The workflow validates version/tag agreement and key identity, then publishes a draft only after all packages verify. Published assets are never overwritten. Releases include Linux/macOS amd64/arm64 packages, `SHA256SUMS`, `publisher.pub` and `release-metadata.json` recording the full source commit, compatibility requirements, publisher and artifact hashes. Verify publisher trust independently before import. No merchant configuration, host order authority or private signing key is packaged. Publishing a release does not update a running ZBoard installation.
+
+## License
+
+This plugin is licensed under [MPL-2.0](LICENSE), including the v0.0.1 source and release. `marketplace-listing.json` records the product identity. Each release provides `marketplace-entry.json` for marketplace registration and discovery; package signatures and host authorization remain independent.

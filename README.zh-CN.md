@@ -150,3 +150,7 @@ TDCloud 收款单过期后仍可能从 `expired` 变为 `paid`。过期表示支
 - 变量 `PLUGIN_PUBLIC_KEY`：对应的 base64 公钥。
 
 流水线核对版本、标签和密钥身份，所有包验证通过后创建草稿并发布；已有发布产物禁止覆盖。Release 包含 Linux/macOS 的 amd64/arm64 安装包、`SHA256SUMS`、`publisher.pub` 和 `release-metadata.json`，记录完整源码提交、兼容要求、发布者和产物摘要。导入前独立确认发布者信任。包内不包含商户配置、宿主订单授权或签名私钥。发布 Release 不会更新正在运行的 ZBoard 插件。
+
+## 许可证
+
+本插件采用 [MPL-2.0](LICENSE)，包括 v0.0.1 的源码和发布版本。`marketplace-listing.json` 记录产品身份，每次发布提供 `marketplace-entry.json` 用于插件中心注册和发现；安装包验签与宿主授权仍独立执行。
