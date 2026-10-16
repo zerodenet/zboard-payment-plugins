@@ -1,6 +1,6 @@
 # TDCloud adapter contract
 
-Aligned with TDCloud merchant collection implementations `8b5b80e` (decimal amounts) and `9bbc8a1` (optional input normalization), and the published merchant collection contract. ZBoard owns business orders and fulfillment; this adapter owns the provider request, private retry snapshot and verified payment result.
+Aligned with TDCloud merchant collection implementations `8b5b80e` (decimal amounts), `9bbc8a1` (optional input normalization), and `562de92` (fee snapshots), plus published contract revision `c6b55e9`. These references identify source contracts, not evidence of production deployment. ZBoard owns business orders and fulfillment; this adapter owns the provider request, private retry snapshot and verified payment result.
 
 ## Creation
 
@@ -40,6 +40,16 @@ Notifications use the same decimal field in `data`, authenticated by TDCloud's e
 
 Merchant-default notifications send `notify_enabled: true` without a per-order URL or secret override. The plugin privately retains TDCloud's platform-issued signing key. Disabled notifications explicitly send `false`; confirmation and browser return still trigger lookup.
 
+## Invoice, buyer total and merchant settlement
+
+`amount` and `currency` remain the original merchant invoice in create results, authenticated lookups and signed notification data. They are the only amount/currency pair compared with the saved ZBoard business order. The modern decimal adapter ignores derived `amount_minor` and `currency_decimals` for this comparison.
+
+TDCloud may additionally return `payment_amount`/`payment_currency` (the buyer's actual total, including fees or TDC conversion), `buyer_fee`, `merchant_fee`, `merchant_fee_tdc`, `gross_settlement_tdc`, `settlement_tdc`, `fee_status` and `fee_version`. These fields belong to the platform cashier and merchant settlement. They neither replace nor repair a missing or mismatched invoice. The adapter does not subtract fees, reverse exchange rates, recalculate invoice units, or use `fee_version` as payment status ordering.
+
+For example, a USD `10.50` business invoice may have a higher buyer total or a TDC payer currency and a lower net TDC settlement. A verified payment still records USD `10.50` with ZBoard. Choosing a method, displaying the fee preview and obtaining buyer confirmation remain TDCloud cashier responsibilities; the plugin does not select an underlying payment method.
+
+Orders and private attempt snapshots created before fee support remain readable without the new fields. No historical amounts, credentials, fees or facts are rewritten. Fee-bearing `expired → paid` results, repeated notifications and additional paid attempts follow the same authenticated lookup, durable receipt and at-most-once fulfillment rules below.
+
 ## Rejections and historical attempts
 
 Saved checkout deadlines are enforced on reopen. An overdue attempt is looked up before its redirect can be reused. Only authenticated checkout expiry permits a new attempt/key on the same host order; a late `paid` result settles the original order. Pending/review results keep the old identity and return `checkout_expiry_pending` to explain why a stale checkout cannot reopen.
@@ -53,6 +63,7 @@ Previously issued version-1 or unversioned snapshots retain their exact integer 
 - Configuration containing only the merchant API origin and OAuth credentials discovers one TDCloud cashier without currency metadata.
 - CNY/USD/TDC/JPY invoices submit decimal text without a provider precision lookup or chosen internal method.
 - Creation, lookup and signed notifications reject changed amount/currency/reference, missing decimal text and nonzero sub-cent fractions.
+- Fee-bearing create results, authenticated lookups and signed notifications retain the original invoice even when payer totals/currency or net settlement differ. Matching payer totals cannot conceal a missing or mismatched original invoice; historical responses without fee fields remain accepted.
 - Timeout and restart retries preserve amount, key, URLs, expiry and notification mode, including historical integer snapshots.
 - Optional omission/null/empty text, default 1800-second expiry, explicit bounds, notification dependencies and normalized idempotency are exercised against a rejecting simulator, not unconditional success responses.
 - Against an isolated committed ZBoard checkout, real plugin processes use the public SDK and demonstrate one payment event and one fulfillment when confirmation races a signed notification.
